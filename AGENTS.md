@@ -10,6 +10,7 @@ Sibling vLLM, vLLM-Ascend, and vLLM-GR checkouts are references unless the task
 explicitly targets them; they are not necessarily the imported runtime.
 
 - For setup and PR workflow, read [CONTRIBUTING.md](CONTRIBUTING.md).
+- For PR review or re-review, use the [GR review skill](.agents/skills/vllm-gr-pr-review/SKILL.md).
 - Before changing runtime behavior, use [development navigation](docs/contributing/development.md)
   to find the owning code and read the relevant linked contract.
 - Before selecting tests, read [validation levels](docs/contributing/ci/test_levels.md#validation-levels)

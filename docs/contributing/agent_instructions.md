@@ -11,6 +11,7 @@ guidance.
 | --- | --- |
 | Project-wide convention or routing a task to its guide | [AGENTS.md](../../AGENTS.md) |
 | Loading the shared instructions in Claude Code | [CLAUDE.md](../../CLAUDE.md) |
+| Adding or updating a repository-local skill | [`.agents/skills/`](../../.agents/skills/) |
 | Contributor setup, review and CI | [Contributing](README.md) |
 | Code ownership and runtime behavior | [Development navigation](development.md) and its linked design documents |
 | Selecting tests or hooks | [Test levels](ci/test_levels.md) and [pre-commit](pre_commit_setup.md) |
