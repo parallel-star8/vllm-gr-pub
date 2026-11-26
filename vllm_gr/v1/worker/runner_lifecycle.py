@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm_gr.config.backend_plan import BackendPlan
+    from vllm_gr.v1.worker.stage_binding import StageBinding
 
 
 @dataclass
@@ -21,7 +22,28 @@ class NativeRunnerAdapter:
     prepare_inputs: Callable[..., Any]
     sample_tokens: Callable[..., Any] | None
 
+    # Native BatchQueue can observe sample before it observes a failed execute.
+    # Keep this completion on the model generation, even if stage creation failed.
+    pending_stage_sample: bool | Exception = False
+
+    def bind_stage_sampler(self, runner: Any, stage: StageBinding) -> None:
+        native_sample = self.sample_tokens
+        if native_sample is None:
+            raise RuntimeError("Admitted GR stage requires a native sample_tokens entry point")
+
+        def sample_tokens(*args: Any, **kwargs: Any) -> Any:
+            pending = self.pending_stage_sample
+            if pending is False:
+                return native_sample(*args, **kwargs)
+            self.pending_stage_sample = False
+            if isinstance(pending, Exception):
+                raise pending
+            return stage.sample(runner, *args, **kwargs)
+
+        self.sample_tokens = sample_tokens
+
     def close(self) -> None:
+        self.pending_stage_sample = False
         # Drop bound callables and their strong references to the native runner.
         self.execute_model = self.prepare_inputs = self.sample_tokens = _closed
 
@@ -43,7 +65,9 @@ def _route_method(original: Any, phase: str) -> Any:
     return routed
 
 
-def install_runner_lifecycle(runner_class: Any, implementation_id: str, *, prepare: str) -> None:
+def install_runner_lifecycle(
+    runner_class: Any, implementation_id: str, *, prepare: str, stage: StageBinding | None = None
+) -> None:
     """Keep native signatures and the execute/sample completion boundaries separate."""
     marker = runner_class.__dict__.get("_gr_runner_implementation_id")
     if marker == implementation_id:
@@ -65,6 +89,7 @@ def install_runner_lifecycle(runner_class: Any, implementation_id: str, *, prepa
         wrappers[name] = _route_method(original, phase)
     for name, wrapper in wrappers.items():
         setattr(runner_class, name, wrapper)
+    runner_class._gr_stage_binding = stage
     runner_class._gr_runner_methods = methods
     runner_class._gr_runner_implementation_id = implementation_id
 

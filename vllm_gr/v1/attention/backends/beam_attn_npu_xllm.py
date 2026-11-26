@@ -35,6 +35,8 @@ from vllm_gr.v1.attention.backends.npu_cache_layout import (
     restore_npu_cache_pool_layout,
 )
 
+DECODE_MODE = "xllm"
+
 logger = init_logger(__name__)
 
 # Fail fast when the mode selects this module but the operator library is

@@ -1418,37 +1418,23 @@ def test_npu_stage_runner_binds_physical_decode_without_mutating_scheduler(
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu", "cpu"])  # type: ignore[misc]
-def test_shared_stage_dispatch_routes_devices(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
+def test_shared_stage_dispatch_requires_binding(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
     from unittest.mock import Mock
 
     from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner
     from vllm_gr.v1.worker.npu import npu_beam_stage_runner
 
-    output = object()
-    stage = SimpleNamespace(execute=Mock(return_value=output))
-    cuda = Mock(return_value=stage)
-    npu = Mock(return_value=stage)
+    cuda = Mock(side_effect=AssertionError("unbound CUDA allocation"))
+    npu = Mock(side_effect=AssertionError("unbound NPU allocation"))
     monkeypatch.setattr(gpu_beam_stage_runner, "get_stage_runner", cuda)
     monkeypatch.setattr(npu_beam_stage_runner, "get_npu_stage_runner", npu)
-    hooks = object()
     worker = SimpleNamespace(device=device)
-    scheduled = _eager_stage_output(kind="prefill")
-    if device == "cpu":
-        with pytest.raises(ValueError, match="no execution adapter"):
-            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
-        cuda.assert_not_called()
-        npu.assert_not_called()
-    else:
-        assert (
-            _gr_dispatch._dispatch_stage_frame(worker, scheduled, object(), hooks_type=hooks)
-            is output
-        )
-        if device == "cuda":
-            assert cuda.call_args.kwargs["hooks_type"] is hooks
-            npu.assert_not_called()
-        else:
-            npu.assert_called_once()
-            cuda.assert_not_called()
+    with pytest.raises(RuntimeError, match="before the runner bound"):
+        _gr_dispatch._dispatch_stage_frame(worker, _eager_stage_output(kind="prefill"), object())
+    cuda.assert_not_called()
+    npu.assert_not_called()
 
 
 def test_npu_graph_context_survives_shape_switch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1606,6 +1592,11 @@ def test_npu_first_decode_native_contract_keeps_six_forward_tokens(
         seen.append("six_token_forward")
         return SimpleNamespace(logits=input_ids[:, None].float())
 
+    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import make_npu_stage_binding
+
+    worker._gr_backend_binding = SimpleNamespace(
+        stage=make_npu_stage_binding(), runner_adapter=SimpleNamespace(pending_stage_sample=False)
+    )
     result = _gr_dispatch._dispatch_stage_frame(worker, logical, native)
     assert result.logits.shape == (6, 1)
     assert logical.total_num_scheduled_tokens == 2
@@ -1637,7 +1628,7 @@ def test_npu_failed_execute_reaches_sample_without_native_fallback(
     if failure_point == "plan":
         monkeypatch.setattr(stage, "_validate_sequence", fail)
     with pytest.raises(ValueError) as execute_error:
-        _gr_dispatch._dispatch_stage_frame(worker, scheduled, fail)
+        npu_beam_stage_runner.execute_npu_stage(worker, scheduled, fail)
     assert execute_error.value is failure
     native_sample = Mock(side_effect=AssertionError("native sampler must not run"))
 

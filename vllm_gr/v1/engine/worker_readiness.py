@@ -14,7 +14,35 @@ from vllm_gr.config.backend_plan import (
 )
 from vllm_gr.platforms.services import validate_required_services
 
+REPORT_FORMAT_VERSION = 2
+
 logger = logging.getLogger(__name__)
+
+
+def _attention_by_kind(runner: Any) -> dict[str, list[str]]:
+    groups = getattr(runner, "attn_groups", ())
+    if not groups:
+        return {}
+    from vllm.v1.kv_cache_interface import get_kv_cache_spec_kind
+
+    selected: dict[str, set[str]] = {}
+    for group in groups:
+        for attention in group:
+            kind = get_kv_cache_spec_kind(attention.kv_cache_spec).value
+            selected.setdefault(kind, set()).add(attention.backend.get_name())
+    return {kind: sorted(names) for kind, names in selected.items()}
+
+
+def _graph_report(binding: Any, runner: Any) -> dict[str, Any] | None:
+    if binding.stage is None or binding.stage.graph_status is None:
+        return None
+    status = binding.stage.graph_status(runner)
+    captured, reasons = status["captured"], status["fallback"]
+    if captured:
+        outcome = "partial_fallback" if reasons else "captured"
+    else:
+        outcome = "fallback" if reasons else "not_captured"
+    return {"outcome": outcome, "captured": captured, "fallback": reasons}
 
 
 def worker_backend_readiness(worker: Any) -> dict[str, Any]:
@@ -26,8 +54,25 @@ def worker_backend_readiness(worker: Any) -> dict[str, Any]:
         raise RuntimeError("Worker has no model runner for backend plan validation")
     binding = bind_backend_services(runner)
     if binding is None:
-        raise RuntimeError("Worker did not receive the engine backend plan")
-    return binding.report()
+        raise RuntimeError(
+            "Worker did not receive the engine backend plan; use the same vllm-gr version on all ranks"
+        )
+    report = binding.report()
+    model = getattr(getattr(runner, "vllm_config", None), "model_config", None)
+    table = getattr(getattr(runner, "constraint_backend", None), "info", None)
+    metadata = getattr(table, "table_metadata", None)
+    report.update(
+        config_digest=binding.plan.request.config_digest,
+        backend_id=binding.plan.backend_id,
+        compatibility=binding.plan.request.compatibility.to_dict(),
+        format_version=REPORT_FORMAT_VERSION,
+        attention_by_kind=_attention_by_kind(runner),
+        decode_mode=getattr(binding.attention_executor, "DECODE_MODE", None),
+        graph=_graph_report(binding, runner),
+        max_model_len=getattr(model, "max_model_len", None),
+        constraint_digest=getattr(metadata, "artifact_digest", None),
+    )
+    return report
 
 
 def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_workers: int) -> None:
@@ -36,7 +81,23 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
     if not isinstance(reports, (list, tuple)) or len(reports) != expected_workers or not reports:
         raise RuntimeError(f"Backend readiness requires {expected_workers} worker reports")
     required = plan.required_services
+    expected_identity = (
+        plan.backend_id,
+        plan.request.config_digest,
+        plan.request.compatibility.to_dict(),
+    )
     services = None
+    runtime_limits = None
+    native = plan.request.native.to_dict()
+    admitted_length = native.get("model_config", {}).get("max_model_len")
+    constraint = plan.request.config.to_dict().get("constraint") or {}
+    table = constraint.get("table") or {}
+    expected_digest = table.get("artifact_digest") if table.get("enabled") else None
+    expected_graph = plan.choices.to_dict().get("graph")
+    requested_decode = (
+        plan.choices.to_dict().get("decode_attention") if "attention" in required else None
+    )
+    per_kind = native.get("attention_per_kind", {})
     for index, report in enumerate(reports):
         if not isinstance(report, dict):
             raise RuntimeError(f"Backend worker {index} is not ready")
@@ -44,8 +105,71 @@ def validate_worker_readiness(plan: BackendPlan, reports: Any, *, expected_worke
             raise RuntimeError(
                 f"Backend worker {index} is not ready: {report.get('error', 'unknown error')}"
             )
-        if report.get("fingerprint") != plan.fingerprint:
-            raise RuntimeError(f"Backend worker {index} plan fingerprint mismatch")
+        if report.get("format_version") != REPORT_FORMAT_VERSION:
+            raise RuntimeError(
+                f"Backend worker {index} readiness format mismatch; use the same vllm-gr version on all ranks"
+            )
+        if (
+            report.get("backend_id"),
+            report.get("config_digest"),
+            report.get("compatibility"),
+        ) != expected_identity:
+            raise RuntimeError(
+                f"Backend worker {index} platform identity, normalized config or runtime version mismatch"
+            )
+        length = report.get("max_model_len")
+        if admitted_length is not None and (
+            type(length) is not int or not 0 < length <= admitted_length
+        ):
+            raise RuntimeError(
+                f"Backend worker {index} max_model_len differs from its admission limit"
+            )
+        if admitted_length is not None and length < admitted_length:
+            logger.warning(
+                "Backend worker %d fitted max_model_len to %d (admitted %d)",
+                index,
+                length,
+                admitted_length,
+            )
+        digest = report.get("constraint_digest")
+        if expected_digest is not None and digest != expected_digest:
+            raise RuntimeError(f"Backend worker {index} loaded constraint digest mismatch")
+        graph = report.get("graph")
+        graph_agreement = None
+        if graph is not None:
+            if (
+                not isinstance(graph, dict)
+                or not isinstance(graph.get("captured"), list)
+                or not isinstance(graph.get("fallback"), dict)
+            ):
+                raise RuntimeError(f"Backend worker {index} returned an invalid graph report")
+            if expected_graph == "eager" and graph["captured"]:
+                raise RuntimeError(
+                    f"Backend worker {index} captured Beam Decode graphs with eager admission"
+                )
+            graph_agreement = (graph.get("outcome"), graph["captured"], sorted(graph["fallback"]))
+        actual_attention = report.get("attention_by_kind")
+        if not isinstance(actual_attention, dict):
+            raise RuntimeError(f"Backend worker {index} lacks resolved attention groups")
+        for kind, selected in actual_attention.items():
+            expected = per_kind.get(kind)
+            if expected is not None and selected != [expected]:
+                raise RuntimeError(
+                    f"Backend worker {index} bound {kind} attention {selected}, expected {expected}"
+                )
+        decode = report.get("decode_mode")
+        if requested_decode is not None and (
+            decode in (None, "auto") or requested_decode not in ("auto", decode)
+        ):
+            raise RuntimeError(
+                f"Backend worker {index} bound Decode mode {decode!r}, expected {requested_decode!r}"
+            )
+        limits = (length, digest, graph_agreement, actual_attention, decode)
+        if runtime_limits is not None and limits != runtime_limits:
+            raise RuntimeError(
+                "Workers disagree on runtime limits, graph captures, attention groups or Decode mode"
+            )
+        runtime_limits = limits
         reported = report.get("services")
         if not isinstance(reported, dict):
             raise RuntimeError(f"Backend worker {index} has no bound services")

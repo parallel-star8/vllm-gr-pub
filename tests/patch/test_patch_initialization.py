@@ -86,10 +86,6 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         call_order.append("npu_spawn")
         return 1
 
-    def apply_attention(force: bool = False) -> int:
-        call_order.append("attention")
-        return 1
-
     def patch_npu_worker() -> int:
         call_order.append("npu_worker")
         return 1
@@ -104,11 +100,6 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_npu_spawn,
     )
     monkeypatch.setattr(
-        runtime_patch.selector_patch,
-        "apply_custom_attention_backend_patch",
-        apply_attention,
-    )
-    monkeypatch.setattr(
         startup_patch,
         "patch_npu_worker_init_device",
         patch_npu_worker,
@@ -119,8 +110,8 @@ def test_runtime_patch_order_preserves_ascend_initialization(
         apply_beam,
     )
 
-    assert runtime_patch._apply_patches(force=True) == 4
-    assert call_order == ["attention", "npu_spawn", "npu_worker", "beam"]
+    assert runtime_patch._apply_patches(force=True) == 3
+    assert call_order == ["npu_spawn", "npu_worker", "beam"]
 
 
 def test_optional_patch_count_tracks_actual_installation(

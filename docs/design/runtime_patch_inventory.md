@@ -27,11 +27,11 @@ Installer: `vllm_gr.plugin.register`
 
 Risk: `high`; process roles: `main`, `engine_core`, `worker`
 
-### GR-PATCH-001 — CUSTOM Attention Selector Compatibility
+### GR-PATCH-001 — Ascend CUSTOM Attention Selection
 
-Scope: `core`; backend ID: `null`
+Scope: `backend`; backend ID: `ascend`
 
-Owner: `vllm_gr/v1/attention/selector_patch.py`
+Owner: `vllm_gr/platforms/ascend/attention_bridge.py`
 
 Installer: `vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch`
 
@@ -137,6 +137,8 @@ Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
 
+Planned GPU runners bind their admitted stage implementation at model load. GR control frames require this binding. Deferred samples and execute failures belong to that runner generation. The CUDA stage owns Decode graph capture.
+
 ### GR-PATCH-012 — NPU ModelRunner Override
 
 Scope: `backend`; backend ID: `ascend`
@@ -146,6 +148,8 @@ Owner: `vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/s
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `npu_worker`
+
+Planned Ascend runners bind the V1 stage implementation at model load. The native runner keeps ownership of its pending NPU stage and retirement state.
 
 ### GR-PATCH-013 — CUSTOM Attention Backend Registration
 

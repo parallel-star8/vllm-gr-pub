@@ -1131,9 +1131,8 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from vllm_gr.v1.worker import gr_startup, model_runner_patch
+    from vllm_gr.v1.worker import model_runner_patch
     from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch as patch
-    from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
 
     stream = SimpleNamespace(wait_stream=lambda _other: None)
     monkeypatch.setattr(patch, "is_prefill_graph_enabled", lambda runner=None: True)
@@ -1180,18 +1179,22 @@ def test_fatal_prefill_capture_error_reaches_worker_startup(
         capture_prefill_graphs=patch.capture_prefill_graphs,
     )
     capture_async = Mock(return_value=None)
-    monkeypatch.setattr(gr_startup, "capture_async_forward", capture_async)
     monkeypatch.setattr(
         model_runner_patch,
         "freeze_gc_after_graph_capture",
         lambda _runner: events.append("freeze"),
     )
 
-    model_runner_patch.install_v1_worker_hooks(platform, cuda_hooks_type=CudaStageHooksV1)
+    model_runner_patch.install_v1_worker_hooks(platform)
     worker = Runner()
+    setattr(
+        worker,
+        "_gr_backend_binding",
+        SimpleNamespace(stage=SimpleNamespace(capture_startup=capture_async)),
+    )
     with pytest.raises(RuntimeError) as raised:
         worker.capture_model()
-    capture_async.assert_called_once_with(worker, hooks_type=CudaStageHooksV1)
+    capture_async.assert_called_once_with(worker, False)
     assert raised.value is error
     assert events == ["native"]
 

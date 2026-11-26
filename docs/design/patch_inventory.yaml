@@ -32,11 +32,11 @@ patches:
     removal_condition: runtime patch installation is no longer required
 
   - id: GR-PATCH-001
-    scope: core
-    backend_id: null
-    owner: vllm_gr/v1/attention/selector_patch.py
+    scope: backend
+    backend_id: ascend
+    owner: vllm_gr/platforms/ascend/attention_bridge.py
     installer: vllm_gr.v1.attention.selector_patch.apply_custom_attention_backend_patch
-    activation: the vLLM attention selector is importable and the wrapper is not installed
+    activation: the admitted GR engine requests CUSTOM on the Ascend platform
     validator_or_test:
       - tests/v1/test_ascend_compat.py::test_selector_installation_is_idempotent_and_force_uses_original
       - tests/v1/test_ascend_compat.py::test_selector_reinstalls_over_replaced_upstream_target
@@ -44,10 +44,10 @@ patches:
       - tests/engine/test_gr_config.py::test_attention_selector_config_reader_propagates_validation_errors
       - tests/integration/test_ascend_attention_backend.py
     process_roles: [engine_core, worker]
-    target: vllm.v1.attention.selector._cached_get_attn_backend
+    target: vllm_ascend.platform.NPUPlatform.get_attn_backend_cls
     risk: critical
     contract: attention-selector-signature
-    removal_condition: upstream preserves and resolves explicit and marker-restored CUSTOM backend intent on every supported platform
+    removal_condition: vllm-ascend respects the explicit selected_backend argument
 
   - id: GR-PATCH-002
     scope: backend
@@ -208,12 +208,13 @@ patches:
     scope: backend
     backend_id: cuda
     owner: vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gpu_model_runner_patch.py and vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_patch.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/stage_binding.py, vllm_gr/v1/worker/cuda/gpu_postprocess_workspace.py, vllm_gr/v1/worker/cuda/v2/gpu_model_runner_v2_resources.py, vllm_gr/v1/worker/cuda/v1/gpu_prefill_inputs.py, vllm_gr/v1/worker/cuda/v2/gpu_prefill_v2.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/v1/worker/cuda/stage_capture.py, vllm_gr/v1/worker/cuda/gpu_stage_hooks.py, vllm_gr/v1/worker/cuda/gpu_beam_stage_runner.py, vllm_gr/v1/worker/cuda/v1/gpu_beam_stage_runner_v1.py, vllm_gr/v1/worker/cuda/v2/gpu_beam_stage_runner_v2.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the CUDA provider mounts Worker utilities at process startup; Worker.init_device installs and verifies the admitted V1 or V2 generation, which binds the planned runner after model load regardless of the management listener; V2 prepares stage Top-K variants before initial or replacement table publication; V2 Prefill fast paths require admitted pure GR batches; fused state writes additionally require fresh complete prompts, empty request state and no pending writes
     binding_validation: first bind and full reload retain the admitted plan across positive native max_model_len reductions within its limit; provider validation sees the live fitted config and other drift fails before service creation
     validator_or_test:
       - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
+      - tests/platforms/test_runner_lifecycle.py::test_stage_dispatch_uses_the_admitted_runner_generation
       - tests/platforms/test_runner_lifecycle.py::test_first_load_binds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_full_reload_rebinds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_autofit_does_not_hide_worker_plan_drift
@@ -249,12 +250,13 @@ patches:
     scope: backend
     backend_id: ascend
     owner: vllm_gr/v1/worker/npu/npu_model_runner_patch.py, vllm_gr/v1/worker/npu/stage_projection.py
-    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/ops/npu/stage_projection.py, vllm_gr/v1/worker/npu/startup_patch.py
+    shared_helpers: vllm_gr/v1/worker/model_runner_common.py, vllm_gr/v1/worker/npu/npu_model_runner_inputs.py, vllm_gr/v1/worker/model_runner_contracts.py, vllm_gr/v1/worker/gr_gc.py, vllm_gr/v1/worker/gr_context.py, vllm_gr/v1/worker/gr_execution.py, vllm_gr/v1/worker/stage_binding.py, vllm_gr/v1/worker/hot_update.py, vllm_gr/constraints/versioned_table.py, vllm_gr/ops/npu/stage_projection.py, vllm_gr/v1/worker/npu/startup_patch.py
     installer: vllm_gr.v1.worker.model_runner_patch.apply_worker_patches
     activation: the Ascend provider discovers NPUModelRunner and binds its planned lifecycle after model load; the delayed NPUWorker.init_device wrapper mounts common Worker utilities before native initialization, independently of the management listener; online Trie reload remains rejected by Core on NPU
     binding_validation: uses the same admitted-plan and native max_model_len autofit checks as GR-PATCH-011
     validator_or_test:
       - vllm_gr.v1.worker.model_runner_patch.validate_model_runner_patch
+      - tests/platforms/test_runner_lifecycle.py::test_stage_dispatch_uses_the_admitted_runner_generation
       - tests/platforms/test_runner_lifecycle.py::test_first_load_binds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_full_reload_rebinds_admitted_plan_after_native_autofit
       - tests/platforms/test_runner_lifecycle.py::test_autofit_does_not_hide_worker_plan_drift

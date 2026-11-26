@@ -21,7 +21,6 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_gr.utils.npu_adapter import is_cuda_available, is_npu_available
@@ -700,7 +699,6 @@ class BeamAttentionImpl(AttentionImpl):
         return output
 
 
-@register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     accept_output_buffer = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -782,7 +780,7 @@ class BeamAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
+        return 0 < head_size <= 256 and head_size % 8 == 0
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:

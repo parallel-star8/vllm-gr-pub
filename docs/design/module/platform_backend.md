@@ -64,9 +64,9 @@ operations. `platforms/protocol.py` keeps the original imports available.
 
 Providers that declare plan API version 3 and an adapter revision can build an
 engine plan with backend services and runner hooks. The plan is admitted and
-attached to the engine config before worker startup. Each worker then
-re-resolves the plan, creates the declared services after model load, and
-attests them through the collective readiness check. Built-in patch IDs declare
+attached to the engine config before worker startup. Each worker verifies its
+normalized configuration, binds the services selected by the engine, and
+reports the actual implementations through the collective readiness check. Built-in patch IDs declare
 ownership in the [patch inventory](../patch_inventory.yaml). The
 [loader tests](../../../tests/platforms/test_plugin_loader.py) exercise
 entry-point registration, version and duplicate rejection, the disable switch,

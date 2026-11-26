@@ -9,7 +9,7 @@ from importlib import import_module
 from threading import RLock
 from typing import Any, cast
 
-from vllm_gr.config.backend_plan import read_backend_plan
+from vllm_gr.config.resolved_choices import read_resolved_choices
 from vllm_gr.platforms.interface import ModelRunnerInstaller
 
 # These IDs are already serialized in admitted plans and reported in readiness.
@@ -61,14 +61,14 @@ def install() -> None:
             # upstream overrides such as watermarking. init_device branches on
             # this exact value when constructing the native runner.
             selected = runner_id(worker.use_v2_model_runner)
-            plan = read_backend_plan(worker.vllm_config)
+            plan = read_resolved_choices(worker.vllm_config)
             if plan is not None:
                 admitted = plan.choices.to_dict().get("runner")
                 if admitted == "legacy-provider-hooks":
                     # API-v1 adapters delegate to this installer without a
                     # runner implementation ID. The normalized request still
                     # records the generation selected by the engine.
-                    admitted = runner_id(plan.request.native.to_dict()["use_v2_model_runner"])
+                    admitted = runner_id(plan.limits.to_dict()["use_v2_model_runner"])
                 if admitted != selected:
                     raise RuntimeError(
                         "CUDA Worker generation differs from the admitted backend plan"

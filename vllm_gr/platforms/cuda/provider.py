@@ -65,6 +65,15 @@ class CUDABackendProvider(BuiltinPlanSupport):
             request,
             PlanData(
                 {
+                    "beam_limits": {
+                        "runner_generation": "v2" if native["use_v2_model_runner"] else "v1",
+                        "local_kv_heads": native.get("local_kv_heads"),
+                        "head_size": native.get("head_size"),
+                        "device_type": "cuda",
+                        "max_decode_rows": None,
+                        "retain_candidate_widths": False,
+                        "constraint_backend": "cuda",
+                    },
                     "runner": runner_id(native["use_v2_model_runner"]),
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_gpu",
                     "prefill_attention": "cuda.cascade",

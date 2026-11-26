@@ -128,6 +128,9 @@ def create_engine_config(self, usage_context=None, headless=False):
             from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
             attention_config.backend = AttentionBackendEnum.CUSTOM
+        from vllm_gr.v1.attention.selector_patch import prepare_engine_attention
+
+        prepare_engine_attention(config)
     if effective_gr_config.beam_max_width is not None:
         from vllm_gr.config.execution import validate_gr_execution_config
 

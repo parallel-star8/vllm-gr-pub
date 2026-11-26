@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
 
@@ -39,6 +39,7 @@ class NPUBackendProvider(BuiltinPlanSupport):
     device_type: str = "npu"
     # Semantic ownership includes deferred hooks and existing shared dispatch.
     patch_ids: ClassVar[tuple[str, ...]] = (
+        "GR-PATCH-001",
         "GR-PATCH-002",
         "GR-PATCH-012",
         "GR-PATCH-016",
@@ -60,11 +61,18 @@ class NPUBackendProvider(BuiltinPlanSupport):
         """
         return identity.device_type == "npu" and identity.has_lineage(_ASCEND_PLATFORM_CLASS)
 
+    @staticmethod
+    def beam_kv_geometry(config: Any) -> tuple[int | None, int | None]:
+        from ..admission import local_kv_geometry
+
+        return local_kv_geometry(config)
+
     def resolve(self, request: BackendRequest) -> BackendPlan:
         """Keep Ascend's V1 runner and its existing auto-decode policy."""
         if request.options.to_dict():
             raise ValueError("Ascend currently accepts no additional backend options")
         gr = request.config.to_dict()
+        native = request.native.to_dict()
         constraint = "canonical" if request.has_constraint_table else "none"
         return BackendPlan(
             self.backend_id,
@@ -72,6 +80,15 @@ class NPUBackendProvider(BuiltinPlanSupport):
             request,
             PlanData(
                 {
+                    "beam_limits": {
+                        "runner_generation": "v2" if native["use_v2_model_runner"] else "v1",
+                        "local_kv_heads": native.get("local_kv_heads"),
+                        "head_size": native.get("head_size"),
+                        "device_type": "npu",
+                        "retain_candidate_widths": True,
+                        "constraint_backend": "npu",
+                        "max_decode_rows": native["scheduler_config"]["max_num_batched_tokens"],
+                    },
                     "runner": "vllm_gr.v1.worker.npu.npu_model_runner_patch",
                     "attention": "vllm_gr.v1.attention.backends.beam_attn_npu",
                     "prefill_attention": "ascend.cascade",

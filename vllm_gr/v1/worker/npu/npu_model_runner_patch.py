@@ -1141,9 +1141,11 @@ def install() -> None:
     """Install the Ascend runner after its native worker initializes device ops."""
     from vllm_gr.v1.beam.batch_contracts import SUPPORTED_BEAM_BATCH_SIZES
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
+    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import make_npu_stage_binding
 
     install_v1_worker_hooks(
         sys.modules[__name__],
         constraint_max_batch=max(SUPPORTED_BEAM_BATCH_SIZES),
         implementation_id=__name__,
+        stage=make_npu_stage_binding(),
     )

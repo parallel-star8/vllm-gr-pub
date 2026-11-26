@@ -509,6 +509,33 @@ def test_extended_generation_fits_native_kv_reorder_buffer(
 
 
 @pytest.mark.l1
+def test_remote_frontend_uses_admitted_kv_geometry_and_runner() -> None:
+    from vllm_gr.config import GRConfig
+    from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
+    from vllm_gr.config.resolved_choices import ResolvedChoices
+    from vllm_gr.platforms.ascend import NPU_BACKEND
+    from vllm_gr.platforms.planning import normalize_backend_request
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
+
+    config = SimpleNamespace(
+        additional_config={},
+        device_config=SimpleNamespace(device="npu"),
+        use_v2_model_runner=False,
+        model_config=SimpleNamespace(get_num_kv_heads=lambda parallel: 2, get_head_size=lambda: 64),
+    )
+    GRConfig(
+        constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=5
+    ).write_to_vllm_config(config)
+    plan = NPU_BACKEND.resolve(normalize_backend_request(config, NPU_BACKEND))
+    config.additional_config[BACKEND_PLAN_KEY] = ResolvedChoices.from_plan(plan).to_wire()
+    config.device_config.device = "cpu"
+    config.use_v2_model_runner = True
+    config.model_config = SimpleNamespace(get_num_kv_heads=Mock(side_effect=AssertionError))
+    validate_gr_device_config(config)
+    config.model_config.get_num_kv_heads.assert_not_called()
+
+
+@pytest.mark.l1
 @pytest.mark.parametrize(
     "heads,head_size", [(0, 128), (-1, 128), (True, 128), (8, 0), (8, None), (8, 128.0)]
 )

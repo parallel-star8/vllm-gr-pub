@@ -282,6 +282,7 @@ def _worker_snapshot(worker: Any) -> dict[str, Any]:
     names = ("token_ids", "scores", "parent_ids", "lengths", "finish_reasons")
     return {
         "retired": True,
+        "stage_implementation": runner._gr_backend_binding.stage.implementation_id,
         "runner": f"{type(runner).__module__}.{type(runner).__name__}",
         "native_requests": runner.req_states.num_reqs if hasattr(runner, "req_states") else None,
         "pending_native_output": getattr(runner, "execute_model_state", None) is not None,
@@ -476,6 +477,8 @@ def _check_snapshot(
     snapshot: dict[str, Any], steps: int, legal: set[tuple[int, ...]]
 ) -> list[tuple[tuple[int, ...], float]]:
     assert snapshot["retired"], "Public result arrived before Worker release"
+    expected_stage = "cuda.v2" if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "1" else "cuda.v1"
+    assert snapshot["stage_implementation"] == expected_stage
     assert not snapshot["active_sessions"] and snapshot["registry_size"] == 0
     assert snapshot["context_released"] and snapshot["workspace_released"]
     assert not any(snapshot["control_busy"]) and not snapshot["pending"]

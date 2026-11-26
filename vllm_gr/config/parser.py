@@ -117,7 +117,9 @@ def _read_settings(path: Path, parents: tuple[Path, ...]) -> dict:
 
 
 GR_CONFIG_KEY: Final = "vllm_gr"
-BACKEND_TRANSPORT_KEYS: Final = frozenset({"vllm_gr_backend_plan", "vllm_gr_backend_options"})
+BACKEND_TRANSPORT_KEYS: Final = frozenset(
+    {"vllm_gr_choices", "vllm_gr_backend_plan", "vllm_gr_backend_options"}
+)
 GRConfigInput: TypeAlias = str | Path
 CAPACITY_FIELDS = ("beam_max_width", "beam_candidate_width")
 CONFIG_ATTRIBUTES = {

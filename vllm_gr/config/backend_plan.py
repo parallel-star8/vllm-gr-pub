@@ -11,9 +11,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 PLAN_API_VERSION = 3
-BACKEND_PLAN_KEY = "vllm_gr_backend_plan"
+BACKEND_PLAN_KEY = "vllm_gr_choices"
+LEGACY_PLAN_KEY = "vllm_gr_backend_plan"
 
 
 def _json_value(value: Any) -> Any:
@@ -66,6 +67,17 @@ class BackendRequest:
     def has_constraint_table(self) -> bool:
         constraint = self.config.to_dict().get("constraint")
         return bool(constraint and constraint["mode"] == "table")
+
+    @property
+    def config_digest(self) -> str:
+        normalized = PlanData(
+            {
+                "config": self.config.to_dict(),
+                "native": self.native.to_dict(),
+                "options": self.options.to_dict(),
+            }
+        )
+        return hashlib.sha256(normalized.canonical_json.encode("ascii")).hexdigest()
 
     @property
     def uses_custom_attention(self) -> bool:
@@ -179,6 +191,8 @@ class BackendPlan:
             services.update(self.requirements.to_dict())
         else:
             choices = self.choices.to_dict()
+            if self.request.uses_beam_v1 and choices.get("stage") is not None:
+                services["stage"] = choices["stage"]
             if choices.get("requires_attention"):
                 services["attention"] = None
             if choices.get("constraint") == "legacy":
@@ -235,8 +249,30 @@ class BackendPlan:
         return plan
 
 
-def read_backend_plan(config: Any) -> BackendPlan | None:
+def backend_wire(config: Any) -> Any:
     additional = getattr(config, "additional_config", None)
-    if not isinstance(additional, Mapping) or BACKEND_PLAN_KEY not in additional:
+    if not isinstance(additional, Mapping):
         return None
-    return BackendPlan.from_wire(additional[BACKEND_PLAN_KEY])
+    if LEGACY_PLAN_KEY in additional:
+        raise ValueError(
+            "Unsupported legacy GR plan format; use the same vllm-gr version on the engine and workers"
+        )
+    if BACKEND_PLAN_KEY not in additional:
+        return None
+    wire = additional[BACKEND_PLAN_KEY]
+    if not isinstance(wire, Mapping):
+        raise ValueError("Invalid GR backend plan envelope")
+    return wire
+
+
+def read_backend_plan(config: Any) -> BackendPlan | None:
+    wire = backend_wire(config)
+    if wire is None:
+        return None
+    if isinstance(wire, Mapping) and "format_version" in wire:
+        from vllm_gr.platforms.planning import worker_plan_from_choices
+
+        from .resolved_choices import ResolvedChoices
+
+        return worker_plan_from_choices(config, ResolvedChoices.from_wire(wire))
+    return BackendPlan.from_wire(wire)

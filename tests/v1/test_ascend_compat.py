@@ -13,23 +13,28 @@ from unittest import mock
 import pytest
 
 from tests.helpers.paths import REPO_ROOT
-from vllm_gr.config import GRAttentionBackend
 from vllm_gr.platforms.ascend import config_patch
 from vllm_gr.v1 import ascend_compat
 from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker.npu import kv_layout_patch, startup_patch
 
 
-def _install_selector_patch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Any, mock.Mock]:
-    import vllm.v1.attention.selector as selector
+def _vendor_platform(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, mock.Mock]:
+    import vllm.platforms
 
-    native_backend = object()
-    native_selector = mock.Mock(return_value=native_backend)
-    monkeypatch.setattr(selector, "_cached_get_attn_backend", native_selector)
-    assert selector_patch.apply_custom_attention_backend_patch() == 1
-    return native_backend, native_selector
+    native = mock.Mock(return_value="vendor.NativeBackend")
+
+    class NPUPlatform:
+        @classmethod
+        def get_attn_backend_cls(
+            cls, selected_backend: Any, attn_selector_config: Any, num_heads: int | None = None
+        ) -> Any:
+            return native(cls, selected_backend, attn_selector_config, num_heads=num_heads)
+
+    NPUPlatform.__module__ = "vllm_ascend.platform"
+    NPUPlatform.__qualname__ = "NPUPlatform"
+    monkeypatch.setattr(vllm.platforms, "current_platform", NPUPlatform())
+    return NPUPlatform, native
 
 
 def test_import_does_not_load_npu_worker() -> None:
@@ -53,168 +58,107 @@ for module_name in ("torch", "torch_npu", "vllm_ascend", "vllm_ascend.worker.wor
     )
 
 
-def test_selector_routes_custom_marker_and_native_backends(
+@pytest.mark.l1  # type: ignore[misc]
+def test_custom_slot_preserves_external_owner_before_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm.v1.attention.selector as selector
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends import registry
 
-    native_backend, native_selector = _install_selector_patch(monkeypatch)
-    beam_backend = object()
-    get_beam_backend = mock.Mock(return_value=beam_backend)
-    monkeypatch.setattr(
-        selector_patch,
-        "_get_custom_beam_backend",
-        get_beam_backend,
-    )
+    custom = registry.AttentionBackendEnum.CUSTOM
+    monkeypatch.setitem(registry._ATTN_OVERRIDES, custom, "other.vendor.Backend")
+    with mock.patch.object(registry.AttentionBackendEnum, "get_class") as resolve:
+        with pytest.raises(RuntimeError, match=r"already registered to other.vendor.Backend"):
+            selector_patch._register_beam_backend()
+        resolve.assert_not_called()
+    assert custom.get_path() == "other.vendor.Backend"
 
-    assert (
-        selector._cached_get_attn_backend(
-            AttentionBackendEnum.CUSTOM,
-            "selector-config",
-            num_heads=8,
-        )
-        is beam_backend
-    )
 
-    monkeypatch.setattr(
-        selector_patch,
-        "_get_current_gr_attention_backend",
-        lambda: GRAttentionBackend.CUSTOM,
-    )
-    assert (
-        selector._cached_get_attn_backend(
-            None,
-            "selector-config",
-            num_heads=8,
-        )
-        is beam_backend
-    )
+@pytest.mark.l1  # type: ignore[misc]
+def test_custom_slot_registers_once_and_resolves_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.v1.attention.backends import registry
 
-    monkeypatch.setattr(
-        selector_patch,
-        "_get_current_gr_attention_backend",
-        lambda: None,
-    )
-    assert (
-        selector._cached_get_attn_backend(
-            None,
-            "selector-config",
-            num_heads=8,
-        )
-        is native_backend
-    )
-    assert (
-        selector._cached_get_attn_backend(
-            AttentionBackendEnum.FLASH_ATTN,
-            "selector-config",
-            num_heads=4,
-        )
-        is native_backend
-    )
+    custom = registry.AttentionBackendEnum.CUSTOM
+    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
+    with mock.patch.object(
+        registry, "register_backend", wraps=registry.register_backend
+    ) as register:
+        selector_patch._register_beam_backend()
+        selector_patch._register_beam_backend()
+        register.assert_called_once_with(custom, selector_patch._BEAM_BACKEND_PATH)
 
-    assert get_beam_backend.call_count == 2
-    assert native_selector.call_args_list == [
-        mock.call(None, "selector-config", num_heads=8),
-        mock.call(
-            AttentionBackendEnum.FLASH_ATTN,
-            "selector-config",
-            num_heads=4,
-        ),
-    ]
+
+@pytest.mark.parametrize("first_custom", [False, True])  # type: ignore[misc]
+def test_selector_routes_custom_marker_and_native_backends(
+    monkeypatch: pytest.MonkeyPatch, first_custom: bool
+) -> None:
+    from vllm.v1.attention.backends import registry
+
+    custom = registry.AttentionBackendEnum.CUSTOM
+    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
+    selector_patch._register_beam_backend()
+    platform, native = _vendor_platform(monkeypatch)
+    assert selector_patch.apply_custom_attention_backend_patch() == 1
+    keys = [custom, None, custom] if first_custom else [None, custom, None]
+
+    @lru_cache
+    def select(key: Any, geometry: str) -> Any:
+        return platform.get_attn_backend_cls(key, geometry, num_heads=4)
+
+    for key in keys:
+        assert select(key, "same") == (custom.get_path() if key else "vendor.NativeBackend")
+    native.assert_called_once_with(platform, None, "same", num_heads=4)
 
 
 def test_selector_installation_is_idempotent_and_force_uses_original(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vllm.v1.attention.selector as selector
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-    _, native_selector = _install_selector_patch(monkeypatch)
-    first_wrapper = selector._cached_get_attn_backend
-
-    assert ascend_compat.apply_ascend_attention_backend_patch() == 0
-    assert selector._cached_get_attn_backend is first_wrapper
+    platform, native = _vendor_platform(monkeypatch)
+    assert ascend_compat.apply_ascend_attention_backend_patch() == 1
+    wrapper = platform.get_attn_backend_cls.__func__
     assert ascend_compat.apply_ascend_attention_backend_patch(force=True) == 0
-    assert selector._cached_get_attn_backend is first_wrapper
-
-    selector._cached_get_attn_backend(
-        AttentionBackendEnum.FLASH_ATTN,
-        "selector-config",
-        num_heads=2,
-    )
-    native_selector.assert_called_once_with(
-        AttentionBackendEnum.FLASH_ATTN,
-        "selector-config",
-        num_heads=2,
-    )
+    assert platform.get_attn_backend_cls.__func__ is wrapper
+    assert platform.get_attn_backend_cls(None, "geometry") == "vendor.NativeBackend"
+    native.assert_called_once_with(platform, None, "geometry", num_heads=None)
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_selector_reinstalls_over_replaced_upstream_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm.v1.attention.selector as selector
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-    _, first_native = _install_selector_patch(monkeypatch)
-    replacement = mock.Mock(return_value="new-native")
-    monkeypatch.setattr(selector, "_cached_get_attn_backend", replacement)
+def test_selector_reinstalls_over_replaced_upstream_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    platform, native = _vendor_platform(monkeypatch)
+    assert selector_patch.apply_custom_attention_backend_patch() == 1
+    replacement = mock.Mock(return_value="vendor.Replacement")
+    monkeypatch.setattr(platform, "get_attn_backend_cls", classmethod(replacement))
     assert selector_patch.apply_custom_attention_backend_patch(force=True) == 1
-    assert selector_patch.apply_custom_attention_backend_patch() == 0
-    assert (
-        selector._cached_get_attn_backend(AttentionBackendEnum.FLASH_ATTN, "config") == "new-native"
-    )
-    replacement.assert_called_once_with(AttentionBackendEnum.FLASH_ATTN, "config", num_heads=None)
-    first_native.assert_not_called()
+    assert platform.get_attn_backend_cls(None, "config") == "vendor.Replacement"
+    native.assert_not_called()
 
 
 @pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("install_wrapper", [False, True])  # type: ignore[misc]
-def test_selector_cache_reset_preserves_installed_callable(
-    monkeypatch: pytest.MonkeyPatch, install_wrapper: bool
-) -> None:
+def test_selector_cache_reset_preserves_installed_callable(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm.platforms
     import vllm.v1.attention.selector as selector
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    calls: list[object] = []
+    monkeypatch.setattr(vllm.platforms, "current_platform", SimpleNamespace(_enum="CUDA"))
 
     @lru_cache
-    def native_selector(backend: Any, config: Any, num_heads: int | None = None) -> object:
-        result = object()
-        calls.append(result)
-        return result
+    def lookup(key: str) -> object:
+        return object()
 
-    monkeypatch.setattr(selector, "_cached_get_attn_backend", native_selector)
-    if install_wrapper:
-        assert selector_patch.apply_custom_attention_backend_patch() == 1
-    installed = selector._cached_get_attn_backend
-    args = (AttentionBackendEnum.FLASH_ATTN, "config")
-    first = installed(*args)
-    assert installed(*args) is first
-    assert len(calls) == 1
-
+    monkeypatch.setattr(selector, "_cached_get_attn_backend", lookup)
+    assert selector_patch.apply_custom_attention_backend_patch() == 0
+    cached = lookup("key")
     selector_patch.clear_attention_backend_cache()
-    assert selector._cached_get_attn_backend is installed
-    assert installed(*args) is not first
-    assert len(calls) == 2
+    assert selector._cached_get_attn_backend is lookup
+    assert lookup("key") is not cached
 
 
-def test_custom_backend_import_failure_is_not_swallowed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm.v1.attention.selector as selector
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+def test_custom_backend_import_failure_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.v1.attention.backends import registry
 
+    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
     monkeypatch.setitem(sys.modules, "vllm_gr.v1.attention.backends.beam_attn", None)
-    native_backend, native_selector = _install_selector_patch(monkeypatch)
-    assert (
-        selector._cached_get_attn_backend(AttentionBackendEnum.FLASH_ATTN, "config")
-        is native_backend
-    )
-    native_selector.assert_called_once()
+    selector_patch._register_beam_backend()
     with pytest.raises(ModuleNotFoundError, match="beam_attn"):
-        selector._cached_get_attn_backend(AttentionBackendEnum.CUSTOM, "config")
+        registry.AttentionBackendEnum.CUSTOM.get_class()
 
 
 def _install_fake_npu_worker(

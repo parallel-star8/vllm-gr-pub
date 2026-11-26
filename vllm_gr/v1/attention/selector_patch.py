@@ -3,11 +3,13 @@
 
 """Hardware-neutral CUSTOM attention selection for GR runtime initialization."""
 
-from typing import Any, cast
+from threading import Lock
+from typing import Any
 
 from vllm_gr.config import GRAttentionBackend, GRConfig
 
-_ORIGINAL_ATTR = "_vllm_gr_custom_attention_original"
+_BEAM_BACKEND_PATH = "vllm_gr.v1.attention.backends.beam_attn.BeamAttentionBackend"
+_REGISTRATION_LOCK = Lock()
 
 
 def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
@@ -16,52 +18,55 @@ def _get_current_gr_attention_backend() -> GRAttentionBackend | None:
     return GRConfig.from_vllm_config(get_current_vllm_config_or_none()).attention_backend
 
 
-def _get_custom_beam_backend() -> type:
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend
+def _register_beam_backend() -> None:
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
 
-    return cast(type[Any], BeamAttentionBackend)
+    custom = AttentionBackendEnum.CUSTOM
+    with _REGISTRATION_LOCK:
+        if custom.is_overridden():
+            owner = custom.get_path()
+            if owner != _BEAM_BACKEND_PATH:
+                raise RuntimeError(
+                    f"GR Beam requires CUSTOM attention, already registered to {owner}. "
+                    "Load these attention backends in separate processes."
+                )
+        else:
+            register_backend(custom, _BEAM_BACKEND_PATH)
+
+
+def prepare_engine_attention(config: Any) -> None:
+    """Claim the process-local slot before a Beam engine constructs its layers."""
+    if GRConfig.from_vllm_config(config).attention_backend is not GRAttentionBackend.CUSTOM:
+        return
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    if (
+        getattr(getattr(config, "attention_config", None), "backend", None)
+        is not AttentionBackendEnum.CUSTOM
+    ):
+        raise ValueError("GR CUSTOM attention must be selected before native attention selection")
+    _register_beam_backend()
+    apply_custom_attention_backend_patch()
 
 
 def clear_attention_backend_cache() -> None:
-    """Clear native selection results while preserving the live GR wrapper."""
-    import vllm.v1.attention.selector as selector_mod
+    from vllm.v1.attention.selector import _cached_get_attn_backend
 
-    current = selector_mod._cached_get_attn_backend
-    native = getattr(current, _ORIGINAL_ATTR, current)
-    native.cache_clear()
+    _cached_get_attn_backend.cache_clear()
 
 
 def apply_custom_attention_backend_patch(force: bool = False) -> int:
-    """Preserve CUSTOM intent without importing hardware execution modules.
+    """Install the bridge on the selected vendor platform when needed."""
+    from vllm.platforms import current_platform
 
-    ``force`` is accepted only for compatibility with existing callers and has
-    no effect. Both values inspect the live selector on every call. Keep an
-    installed wrapper; if upstream replaces the target, wrap the new callable
-    rather than restoring a stale saved original.
-    """
+    from vllm_gr.platforms.identity import platform_identity
+
     del force
-    try:
-        import vllm.v1.attention.selector as selector_mod
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    except ImportError:
+    if not platform_identity(current_platform).has_lineage("vllm_ascend.platform.NPUPlatform"):
         return 0
+    from vllm_gr.platforms.ascend.attention_bridge import install
 
-    original = selector_mod._cached_get_attn_backend
-    if _ORIGINAL_ATTR in getattr(original, "__dict__", {}):
-        return 0
-
-    def _patched_cached_get_attn_backend(
-        backend: Any,
-        attn_selector_config: Any,
-        num_heads: int | None = None,
-    ) -> Any:
-        # Preserve the original CUSTOM import error rather than hiding it.
-        if backend == AttentionBackendEnum.CUSTOM:
-            return _get_custom_beam_backend()
-        if backend is None and _get_current_gr_attention_backend() is GRAttentionBackend.CUSTOM:
-            return _get_custom_beam_backend()
-        return original(backend, attn_selector_config, num_heads=num_heads)
-
-    setattr(_patched_cached_get_attn_backend, _ORIGINAL_ATTR, original)
-    selector_mod._cached_get_attn_backend = _patched_cached_get_attn_backend
-    return 1
+    return install(type(current_platform))

@@ -724,17 +724,24 @@ def is_patched(runner_class: type) -> bool:
 
 def install() -> None:
     """Install CUDA Worker utilities and the V1 native runner wrappers."""
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import make_cuda_stage_binding
     from vllm_gr.v1.worker.cuda.gpu_postprocess_workspace import (
         make_load_model_with_beam_postprocess_workspace,
     )
     from vllm_gr.v1.worker.cuda.runner_installer import install_worker_hooks
+    from vllm_gr.v1.worker.cuda.stage_capture import capture_cuda_v1_forward
     from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
     from vllm_gr.v1.worker.model_runner_patch import install_v1_worker_hooks
+
+    def capture(worker, allow_eager_fallback):
+        return capture_cuda_v1_forward(
+            worker, hooks_type=CudaStageHooksV1, allow_eager_fallback=allow_eager_fallback
+        )
 
     install_worker_hooks()
     install_v1_worker_hooks(
         sys.modules[__name__],
-        cuda_hooks_type=CudaStageHooksV1,
         workspace_load_patcher=make_load_model_with_beam_postprocess_workspace,
         implementation_id=V1_RUNNER,
+        stage=make_cuda_stage_binding("cuda.v1", CudaStageHooksV1, capture),
     )

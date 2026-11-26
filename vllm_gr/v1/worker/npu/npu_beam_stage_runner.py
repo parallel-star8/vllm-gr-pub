@@ -54,6 +54,7 @@ from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
+from vllm_gr.v1.worker.stage_binding import StageBinding
 
 
 class NPUEagerBeamStageRunner:
@@ -1038,3 +1039,61 @@ __all__ = [
     "execute_npu_gr_retirement",
     "get_npu_stage_runner",
 ]
+
+
+def execute_npu_stage(
+    worker: Any, scheduled: Any, original: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    owner = get_npu_stage_runner(worker, scheduled)
+    try:
+        return owner.execute(scheduled, original, *args, **kwargs)
+    except Exception as error:
+        owner.execution_error = error
+        raise
+
+
+def capture_ascend_forward(worker: Any, allow_eager_fallback: bool) -> bool:
+    from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
+    from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
+    from vllm_gr.v1.worker.gr_startup import _capture_enabled
+
+    with torch.inference_mode():
+        if configured_constraint_mode(_get_gr_config(worker)) is ConstraintMode.NONE:
+            validate_gr_device_config(worker.vllm_config)
+        if not _capture_enabled(worker):
+            return False
+        from vllm.config import set_current_vllm_config
+
+        from vllm_gr.v1.worker.npu.npu_model_runner_patch import (
+            capture_beam_decode_graph,
+        )
+
+        # Ascend's native capture can restore its config context before
+        # GR starts capturing. Bind this worker's config for mode selection
+        # and the dummy forwards so they use the same Decode backend.
+        with set_current_vllm_config(worker.vllm_config):
+            captured: bool = capture_beam_decode_graph(worker)
+        return captured
+
+
+def _stage_graph_status(worker: Any) -> dict[str, Any]:
+    return {
+        "captured": sorted(
+            list(shape) for shape in getattr(worker, "_gr_npu_beam_graph_shapes", ())
+        ),
+        "fallback": dict(getattr(worker, "_beam_graph_fallback_reasons", {})),
+    }
+
+
+def make_npu_stage_binding() -> StageBinding:
+    return StageBinding(
+        "ascend.v1",
+        execute_npu_stage,
+        lambda worker, grammar_output=None: worker._gr_npu_stage_runner.sample(grammar_output),
+        execute_npu_gr_retirement,
+        # Ascend releases its owner through the explicit retirement frame.
+        lambda worker, finished: None,
+        capture_ascend_forward,
+        _stage_graph_status,
+    )

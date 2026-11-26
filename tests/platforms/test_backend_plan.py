@@ -197,7 +197,12 @@ def test_service_requirements_extend_existing_wire_plans() -> None:
     legacy = BackendPlan(
         "fixture", 2, BackendRequest(empty, empty, empty, empty), PlanData({"stage": "old"})
     )
-    assert legacy.fingerprint == "f880bb8af6a14cd99c38a21ba54208c71037f11bb7bf07921698a31d748c3255"
+    old = legacy.to_wire()
+    old["plan"]["schema_version"] = 1
+    old["fingerprint"] = "f880bb8af6a14cd99c38a21ba54208c71037f11bb7bf07921698a31d748c3255"
+    with pytest.raises(ValueError, match="schema"):
+        BackendPlan.from_wire(old)
+    assert legacy.fingerprint == "60b8e5a0bb1fd47e44189fee6c8dca6f445b14cfef0d5170ce011c2df15ab4b1"
     assert "requirements" not in legacy.to_dict()
     assert BackendPlan.from_wire(legacy.to_wire()) == legacy
     plan = replace(legacy, requirements=ServiceRequirements(stage="external.stage"))
@@ -293,7 +298,14 @@ def test_canonical_table_reports_its_identity_and_keeps_its_native_owner(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "field,value", [("schema_version", 2), ("schema_version", True), ("plan_api_version", 2)]
+    "field,value",
+    [
+        ("schema_version", 1),
+        ("schema_version", 3),
+        ("schema_version", True),
+        ("plan_api_version", 2),
+        ("plan_api_version", 4),
+    ],
 )
 def test_wire_rejects_unsupported_schema(provider: Provider, field: str, value: Any) -> None:
     plan = admit_backend_plan(config())
@@ -322,6 +334,30 @@ def test_fingerprint_covers_choices_and_compatibility_but_not_local_device(
         BackendPlan.from_wire(wire)
 
 
+def test_compact_choices_are_checked_against_worker_local_state(
+    provider: Provider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = config()
+    plan = admit_backend_plan(native)
+    wire = native.additional_config[BACKEND_PLAN_KEY]
+    assert wire["format_version"] == 2
+    assert "request" not in wire and "plan" not in wire and "fingerprint" not in wire
+
+    def unexpected_resolve(*args: Any) -> None:
+        pytest.fail("Workers must consume engine choices without running admission again")
+
+    monkeypatch.setattr(provider, "resolve", unexpected_resolve)
+    assert wire["config_digest"] == plan.request.config_digest
+    assert read_backend_plan(native) == plan
+    wire["choices"]["runner"] = "different-runner"
+    with pytest.raises(RuntimeError, match="Worker backend plan mismatch"):
+        bind_backend_services(SimpleNamespace(vllm_config=native))
+    assert provider.created == []
+    wire["format_version"] = 1
+    with pytest.raises(ValueError, match="same vllm-gr version"):
+        read_backend_plan(native)
+
+
 def test_two_engines_bind_their_own_plan_runner_and_device(provider: Provider) -> None:
     first = SimpleNamespace(vllm_config=config(16), device="test:0")
     second = SimpleNamespace(vllm_config=config(32), device="test:1")
@@ -342,6 +378,57 @@ def test_two_engines_bind_their_own_plan_runner_and_device(provider: Provider) -
     assert not any(service.closed for service in provider.created[3:])
 
 
+def test_readiness_checks_actual_decode_and_per_kind_selection(provider: Provider) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    native = config()
+    native.attention_config = SimpleNamespace(
+        backend_per_kind={"full_attention": AttentionBackendEnum.CUSTOM}
+    )
+    plan = admit_backend_plan(native)
+    runner = SimpleNamespace(vllm_config=native)
+    binding = bind_backend_services(runner)
+    binding.attention_executor.DECODE_MODE = "cascade"
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["decode_mode"] == "cascade"
+    assert plan.request.native.to_dict()["attention_per_kind"] == {"full_attention": "CUSTOM"}
+    report["attention_by_kind"] = {"full_attention": ["CUSTOM"]}
+    plan = replace(plan, choices=PlanData({**plan.choices.to_dict(), "decode_attention": "auto"}))
+    report["fingerprint"] = plan.fingerprint
+    validate_worker_readiness(plan, [report], expected_workers=1)
+    for missing in ("auto", None):
+        with pytest.raises(RuntimeError, match="bound Decode mode"):
+            validate_worker_readiness(
+                plan, [{**report, "decode_mode": missing}], expected_workers=1
+            )
+    with pytest.raises(RuntimeError, match="Workers disagree"):
+        validate_worker_readiness(
+            plan, [report, {**report, "decode_mode": "xllm"}], expected_workers=2
+        )
+    with pytest.raises(RuntimeError, match="bound full_attention"):
+        validate_worker_readiness(
+            plan,
+            [{**report, "attention_by_kind": {"full_attention": ["FLASH_ATTN"]}}],
+            expected_workers=1,
+        )
+    plan = replace(plan, choices=PlanData({**plan.choices.to_dict(), "decode_attention": "xllm"}))
+    with pytest.raises(RuntimeError, match="bound Decode mode"):
+        validate_worker_readiness(
+            plan, [{**report, "fingerprint": plan.fingerprint}], expected_workers=1
+        )
+
+
+def test_readiness_rejects_graph_capture_for_an_eager_plan(provider: Provider) -> None:
+    native = config()
+    plan = admit_backend_plan(native)
+    runner = SimpleNamespace(vllm_config=native)
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    plan = replace(plan, choices=PlanData({**plan.choices.to_dict(), "graph": "eager"}))
+    report["graph"] = {"outcome": "captured", "captured": [[1, 128, 1024]], "fallback": {}}
+    with pytest.raises(RuntimeError, match="eager admission"):
+        validate_worker_readiness(plan, [report], expected_workers=1)
+
+
 def test_worker_configuration_drift_fails_before_any_factory(provider: Provider) -> None:
     native = config()
     admit_backend_plan(native)
@@ -358,7 +445,23 @@ def test_readiness_preserves_binding_after_native_kv_cache_autofit(provider: Pro
     runner = SimpleNamespace(vllm_config=native)
     binding = bind_backend_services(runner)
     native.model_config.max_model_len = 2048
-    assert worker_backend_readiness(SimpleNamespace(model_runner=runner)) == binding.report()
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["max_model_len"] == 2048
+    validate_worker_readiness(plan, [report], expected_workers=1)
+    for length in (0, 4097, True):
+        with pytest.raises(RuntimeError, match="max_model_len"):
+            validate_worker_readiness(
+                plan, [{**report, "max_model_len": length}], expected_workers=1
+            )
+    with pytest.raises(RuntimeError, match="readiness format mismatch"):
+        validate_worker_readiness(plan, [{**report, "format_version": 1}], expected_workers=1)
+    with pytest.raises(RuntimeError, match="Workers disagree"):
+        validate_worker_readiness(
+            plan, [report, {**report, "max_model_len": 2047}], expected_workers=2
+        )
+    for key in ("config_digest", "backend_id", "compatibility"):
+        with pytest.raises(RuntimeError, match="runtime version mismatch"):
+            validate_worker_readiness(plan, [{**report, key: "mismatched"}], expected_workers=1)
     assert binding.plan == plan
     assert len(provider.created) == 3
 
@@ -386,7 +489,7 @@ def test_partial_factory_failure_releases_already_created_services(
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
-    "fault", ["missing", "count", "not-ready", "fingerprint", "implementation"]
+    "fault", ["missing", "count", "not-ready", "config-digest", "implementation"]
 )
 def test_readiness_requires_every_worker_to_agree(provider: Provider, fault: str) -> None:
     native = config()
@@ -402,8 +505,8 @@ def test_readiness_requires_every_worker_to_agree(provider: Provider, fault: str
         reports.pop()
     elif fault == "not-ready":
         reports[1]["ready"] = False
-    elif fault == "fingerprint":
-        reports[1]["fingerprint"] = "different"
+    elif fault == "config-digest":
+        reports[1]["config_digest"] = "different"
     else:
         reports[1]["services"]["attention"] = "another-implementation"
     with pytest.raises(RuntimeError):
@@ -444,7 +547,7 @@ def test_external_launcher_readiness_gathers_each_rank(
     if failure == "remote":
         remote = {"ready": False, "error": "remote worker failed"}
     elif failure == "plan-drift":
-        remote["fingerprint"] = "different"
+        remote["config_digest"] = "different"
     group = object()
     received = []
 
@@ -472,7 +575,7 @@ def test_external_launcher_readiness_gathers_each_rank(
         executor.shutdown.assert_not_called()
     else:
         with pytest.raises(
-            RuntimeError, match="local worker failed|remote worker failed|fingerprint mismatch"
+            RuntimeError, match="local worker failed|remote worker failed|normalized config"
         ):
             verify_engine_backend_readiness(engine)
         executor.shutdown.assert_called_once_with()

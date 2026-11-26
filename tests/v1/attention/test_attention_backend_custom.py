@@ -217,6 +217,41 @@ class TestBeamAttentionVllmApiContract(unittest.TestCase):
             )
         assert reasons == []
 
+    @pytest.mark.l1
+    def test_cuda_platform_checks_custom_geometry(self):
+        import torch
+        from vllm.platforms.cuda import CudaPlatform
+        from vllm.platforms.interface import DeviceCapability
+        from vllm.v1.attention.backends import registry
+        from vllm.v1.attention.selector import AttentionSelectorConfig
+
+        from vllm_gr.v1.attention import selector_patch
+        from vllm_gr.v1.attention.backends import beam_attn
+
+        config = AttentionSelectorConfig(
+            head_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto", block_size=16
+        )
+        execution = SimpleNamespace(is_available=lambda: True, get_flash_attn_version=lambda: 2)
+        with (
+            mock.patch.dict(registry._ATTN_OVERRIDES, clear=True),
+            mock.patch.object(
+                CudaPlatform, "get_device_capability", return_value=DeviceCapability(8, 9)
+            ),
+            mock.patch.object(beam_attn, "CUDA_DEVICE", True),
+            mock.patch.object(beam_attn, "NPU_DEVICE", False),
+            mock.patch.object(beam_attn, "_get_platform_execution_module", return_value=execution),
+        ):
+            selector_patch._register_beam_backend()
+            custom = registry.AttentionBackendEnum.CUSTOM
+            assert CudaPlatform.get_attn_backend_cls(custom, config) == custom.get_path()
+            for field, value, error in (
+                ("head_size", 0, "head_size"),
+                ("kv_cache_dtype", "fp8", "kv_cache_dtype"),
+                ("block_size", 17, "block_size"),
+            ):
+                with self.subTest(field=field), self.assertRaisesRegex(ValueError, error):
+                    CudaPlatform.get_attn_backend_cls(custom, config._replace(**{field: value}))
+
     def test_backend_pins_ascend_kv_cache_shape(self):
         """vLLM 0.30 dropped the base-class method; the NPU runner calls it."""
         from vllm import envs as vllm_envs

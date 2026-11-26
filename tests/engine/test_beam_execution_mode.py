@@ -42,7 +42,6 @@ def test_v1_requires_native_async() -> None:
 def test_v1_npu_startup_routes_to_acl_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_gr.v1.worker import gr_startup
     from vllm_gr.v1.worker.npu import npu_model_runner_patch
 
     capture = Mock(return_value=True)
@@ -64,7 +63,9 @@ def test_v1_npu_startup_routes_to_acl_graph_capture(
         vllm_config=worker_vllm_config,
     )
 
-    assert gr_startup.capture_async_forward(worker)
+    from vllm_gr.v1.worker.npu.npu_beam_stage_runner import capture_ascend_forward
+
+    assert capture_ascend_forward(worker, False)
     capture.assert_called_once_with(worker)
 
 

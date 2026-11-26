@@ -11,6 +11,7 @@ import pytest
 
 from vllm_gr.config import GRConfig
 from vllm_gr.config.backend_plan import BackendPlan, BackendRequest, PlanData
+from vllm_gr.config.resolved_choices import ResolvedChoices
 from vllm_gr.platforms import loader
 from vllm_gr.platforms.planning import admit_backend_plan
 from vllm_gr.platforms.services import LegacyPlanningProvider
@@ -26,6 +27,7 @@ from vllm_gr.v1.worker.runner_lifecycle import (
     has_runner_lifecycle,
     install_runner_lifecycle,
 )
+from vllm_gr.v1.worker.stage_binding import StageBinding
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
 
@@ -228,7 +230,10 @@ def test_first_load_binds_admitted_plan_after_native_autofit(
     assert runner._gr_backend_binding.plan == plan
     assert runner._gr_backend_binding.runner_adapter is adapter
     assert runner.vllm_config.model_config.max_model_len == 2048
-    assert runner.vllm_config.additional_config["vllm_gr_backend_plan"] == plan.to_wire()
+    assert (
+        runner.vllm_config.additional_config["vllm_gr_choices"]
+        == ResolvedChoices.from_plan(plan).to_wire()
+    )
     assert observed_lengths == [2048]
     provider.create_model_runner_adapter.assert_called_once_with(plan=plan, native_runner=runner)
     assert worker_backend_readiness(SimpleNamespace(model_runner=runner))["fingerprint"] == (
@@ -253,14 +258,20 @@ def test_full_reload_rebinds_admitted_plan_after_native_autofit(
     assert load(runner, first) is first
     previous = runner._gr_backend_binding
     runner.vllm_config.model_config.max_model_len = 2048
-    assert worker_backend_readiness(SimpleNamespace(model_runner=runner)) == previous.report()
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["services"] == previous.report()["services"]
+    assert report["fingerprint"] == previous.plan.fingerprint
+    assert report["max_model_len"] == runner.vllm_config.model_config.max_model_len
     second = object()
     assert load(runner, second) is second
     assert runner._gr_backend_binding is not previous
     assert runner._gr_backend_binding.plan == plan
     assert runner._gr_backend_binding.runner_adapter is new
     assert runner.vllm_config.model_config.max_model_len == 2048
-    assert runner.vllm_config.additional_config["vllm_gr_backend_plan"] == plan.to_wire()
+    assert (
+        runner.vllm_config.additional_config["vllm_gr_choices"]
+        == ResolvedChoices.from_plan(plan).to_wire()
+    )
     assert provider.create_model_runner_adapter.call_count == 2
     assert provider.validate_worker.call_count == 2
     assert all(call.kwargs["plan"] == plan for call in provider.validate_worker.call_args_list)
@@ -380,3 +391,127 @@ def test_first_load_cleans_partial_resources_before_a_binding_exists(
     native_resource.close.assert_called_once_with()
     close_table.assert_called_once_with(runner)
     assert runner.native_resource is None
+
+
+@pytest.mark.parametrize("failure", [False, True])  # type: ignore[misc]
+def test_stage_dispatch_uses_the_admitted_runner_generation(
+    monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_gr.v1.beam.dispatch import GR_RETIRE_OUTPUT_ATTR, GR_STAGE_OUTPUT_ATTR
+    from vllm_gr.v1.worker.model_runner_common import make_patched_execute_model
+
+    native = Mock(return_value="ordinary")
+    native_sample = Mock(return_value="native sample")
+    stage = StageBinding("test.stage", Mock(), Mock(), Mock(), Mock(), Mock())
+
+    class Runner:
+        # Any attempt to rediscover the hardware during dispatch must fail.
+        @property
+        def device(self) -> str:
+            if getattr(self, "_gr_backend_binding", None) is not None:
+                raise AssertionError("bound dispatch inspected device")
+            return "test"
+
+        @make_patched_execute_model  # type: ignore[misc]
+        def execute_model(self, scheduled: Any) -> Any:
+            return native(self, scheduled)
+
+        def sample_tokens(self, grammar_output: Any) -> Any:
+            return native_sample(self, grammar_output)
+
+        def prepare_inputs(self) -> None:
+            pass
+
+    provider = Mock(
+        backend_id="test",
+        api_version=2,
+        plan_api_version=3,
+        adapter_revision="1",
+        vendor_distribution=None,
+    )
+    provider.resolve.side_effect = lambda request: BackendPlan(
+        "test", 2, request, PlanData({"runner": "test.runner", "stage": "test.stage"})
+    )
+    provider.create_model_runner_adapter.side_effect = (
+        lambda plan, native_runner: bind_native_runner(plan, native_runner)
+    )
+    monkeypatch.setattr(loader, "activate_current_backend", lambda: provider)
+    config = SimpleNamespace(additional_config={})
+    GRConfig(beam_max_width=16).write_to_vllm_config(config)
+    admit_backend_plan(config)
+    install_runner_lifecycle(Runner, "test.runner", prepare="prepare_inputs", stage=stage)
+    runner: Any = Runner()
+    runner.vllm_config = config
+    ordinary = SchedulerOutput.make_empty()
+    assert runner.execute_model(ordinary) == "ordinary"
+    frame = SchedulerOutput.make_empty()
+    setattr(frame, GR_STAGE_OUTPUT_ATTR, {"session": object()})
+    with pytest.raises(RuntimeError, match="before the runner bound"):
+        runner.execute_model(frame)
+
+    load = bind_after_model_load(lambda self: None)
+    with monkeypatch.context() as mismatch:
+        from dataclasses import replace
+
+        mismatch.setattr(Runner, "_gr_stage_binding", replace(stage, implementation_id="wrong"))
+        with pytest.raises(RuntimeError, match="differs from the admitted backend plan"):
+            load(runner)
+    assert getattr(runner, "_gr_backend_binding", None) is None
+    load(runner)
+    original_binding = runner._gr_backend_binding
+    assert original_binding.stage is stage
+    from vllm_gr.v1.engine.worker_readiness import (
+        validate_worker_readiness,
+        worker_backend_readiness,
+    )
+
+    report = worker_backend_readiness(SimpleNamespace(model_runner=runner))
+    assert report["services"]["stage"] == stage.implementation_id
+    validate_worker_readiness(original_binding.plan, [report], expected_workers=1)
+    report["services"]["stage"] = "different.stage"
+    with pytest.raises(RuntimeError, match="stage implementation mismatch"):
+        validate_worker_readiness(original_binding.plan, [report], expected_workers=1)
+    error = ValueError("stage owner creation failed")
+    execute = stage.execute
+    assert isinstance(execute, Mock)
+    execute.side_effect = error if failure else None
+    execute.return_value = None
+    if failure:
+        with pytest.raises(ValueError) as raised:
+            runner.execute_model(frame)
+        assert raised.value is error
+    else:
+        assert runner.execute_model(frame) is None
+    owned = execute.call_args.args[1]
+    assert owned is not frame and owned.finished_req_ids is not frame.finished_req_ids
+    with pytest.raises(RuntimeError, match="before model reload"):
+        load(runner)
+    assert runner._gr_backend_binding is original_binding
+    if failure:
+        with pytest.raises(ValueError) as sampled:
+            runner.sample_tokens(None)
+        assert sampled.value is error
+    else:
+        assert isinstance(stage.sample, Mock)
+        assert runner.sample_tokens(None) is stage.sample.return_value
+        stage.sample.assert_called_once_with(runner, None)
+    native_sample.assert_not_called()
+
+    retirement = SchedulerOutput.make_empty()
+    setattr(retirement, GR_RETIRE_OUTPUT_ATTR, object())
+    assert isinstance(stage.retire, Mock)
+    assert runner.execute_model(retirement) is stage.retire.return_value
+    assert stage.retire.call_args.args[1] is not retirement
+    native.assert_called_once()
+    load(runner)
+    assert runner._gr_backend_binding is not original_binding
+    ordinary.finished_req_ids.add("done")
+    assert runner.execute_model(ordinary) == "ordinary"
+    assert isinstance(stage.cancel_finished, Mock)
+    stage.cancel_finished.assert_called_once_with(runner, {"done"})
+    assert runner.sample_tokens(None) == "native sample"
+    close_backend_binding(runner)
+    with pytest.raises(RuntimeError, match="before the runner bound"):
+        runner.execute_model(retirement)

@@ -358,8 +358,7 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch: pytest.MonkeyPatch, mode: int | None
 ) -> None:
     import builtins
-
-    from vllm_gr.v1.worker import gr_startup
+    from dataclasses import replace
 
     events: list[str] = []
 
@@ -392,15 +391,12 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch.setattr(
         npu_model_runner_patch, "capture_beam_decode_graph", lambda _: events.append("legacy")
     )
-    monkeypatch.setattr(
-        gr_startup,
-        "capture_async_forward",
-        lambda _, *, hooks_type: (
-            events.append("stages")
-            if hooks_type is None
-            else pytest.fail("NPU received CUDA hooks")
-        ),
-    )
+
+    def capture(worker: Any, native_decode_captured: bool) -> bool:
+        assert not native_decode_captured
+        events.append("stages")
+        return True
+
     monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
 
     original_import = builtins.__import__
@@ -412,7 +408,16 @@ def test_npu_fallback_installs_v1_and_keeps_capture_protocol_selection(
     monkeypatch.setattr(builtins, "__import__", without_cuda_hooks)
     model_runner_patch.apply_worker_patches()
     assert model_runner_patch.is_worker_runner_patched(Runner)
-    assert Runner().capture_model() == 17
+    runner = Runner()
+    if mode is not None:
+        stage = getattr(Runner, "_gr_stage_binding")
+        assert stage.implementation_id == "ascend.v1"
+        setattr(
+            runner,
+            "_gr_backend_binding",
+            SimpleNamespace(stage=replace(stage, capture_startup=capture)),
+        )
+    assert runner.capture_model() == 17
     assert events == ["native", "stages" if mode is not None else "legacy"]
 
 

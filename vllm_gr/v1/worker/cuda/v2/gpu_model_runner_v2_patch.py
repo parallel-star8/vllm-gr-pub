@@ -64,6 +64,7 @@ from vllm_gr.v1.worker.model_runner_patch import (
     make_load_model_with_constraint_backend,
     make_shutdown_with_constraint_backend,
 )
+from vllm_gr.v1.worker.stage_binding import bound_stage, require_stage
 
 logger = init_logger(__name__)
 
@@ -119,8 +120,6 @@ def make_patched_execute_model_v2(
     if getattr(_orig_execute_model, _WORKER_EXECUTE_PATCH_MARKER, False):
         return _orig_execute_model
 
-    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
-
     @wraps(_orig_execute_model)
     def _patched_execute_model_step_v2(
         self: Any, scheduler_output: Any, *args: Any, **kwargs: Any
@@ -134,7 +133,6 @@ def make_patched_execute_model_v2(
             scheduler_output,
             _orig_execute_model,
             *args,
-            hooks_type=CudaStageHooksV2,
             **kwargs,
         )
         if stage is not gr_execution._NOT_A_STAGE_FRAME:
@@ -146,6 +144,11 @@ def make_patched_execute_model_v2(
                 "configure gr.beam_width or unset VLLM_USE_V2_MODEL_RUNNER"
             )
 
+        finished = getattr(scheduler_output, "finished_req_ids", ())
+        if finished:
+            binding = bound_stage(self)
+            if binding is not None:
+                binding.cancel_finished(self, finished)
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     @wraps(_orig_execute_model)
@@ -311,7 +314,7 @@ def make_patched_capture_model_v2(_orig_capture_model: Any) -> Any:
 
             capturing_enabled = monitor.cudagraph_capturing_enabled
             try:
-                v2_resources.capture_multibatch_forward(self)
+                require_stage(self).capture_startup(self, True)
             finally:
                 # Beam's local capture closes its window. Profiling runs
                 # inside native startup, which still needs to capture later.
@@ -355,13 +358,21 @@ def _apply_v2_runner_patches() -> None:
     Backend load wrapper last, so the final ``load_model`` carries the
     constraint marker that the V2 validation gate checks.
     """
+    from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import make_cuda_stage_binding
+    from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
     from vllm_gr.v1.worker.runner_binding import bind_after_model_load
     from vllm_gr.v1.worker.runner_lifecycle import install_runner_lifecycle
 
+    def capture(worker: Any, allow_eager_fallback: bool) -> bool:
+        return v2_resources.capture_multibatch_forward(
+            worker, allow_eager_fallback=allow_eager_fallback
+        )
+
+    stage = make_cuda_stage_binding("cuda.v2", CudaStageHooksV2, capture)
     for runner_name, runner_type in discover_worker_runners():
         runner_class = cast(Any, runner_type)
         if is_worker_runner_v2_patched(runner_class):
-            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+            install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs", stage=stage)
             continue
         load_model = getattr(runner_class, "load_model", None)
         if callable(load_model) and not getattr(
@@ -410,7 +421,7 @@ def _apply_v2_runner_patches() -> None:
         runner_class.load_model = bind_after_model_load(
             runner_class.load_model, close_runtime=v2_resources.close_v2_runtime
         )
-        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs")
+        install_runner_lifecycle(runner_class, V2_RUNNER, prepare="prepare_inputs", stage=stage)
         logger.info("%s V2 hooks patched successfully.", runner_name)
 
 

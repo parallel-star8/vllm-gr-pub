@@ -12,10 +12,12 @@ from typing import Any
 
 from vllm_gr.config.backend_plan import (
     BACKEND_PLAN_KEY,
+    LEGACY_PLAN_KEY,
     BackendPlan,
     BackendRequest,
     PlanData,
 )
+from vllm_gr.config.resolved_choices import ResolvedChoices
 
 from .loader import external_provider_entry_points
 
@@ -103,6 +105,12 @@ def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
         if section == "model_config" and values["dtype"] is not None:
             values["dtype"] = str(values["dtype"])
         native[section] = values
+    attention = getattr(config, "attention_config", None)
+    overrides = getattr(attention, "backend_per_kind", None) or {}
+    native["attention_per_kind"] = {
+        kind: backend.name if isinstance(backend, Enum) else backend
+        for kind, backend in overrides.items()
+    }
     native["use_v2_model_runner"] = bool(getattr(config, "use_v2_model_runner", False))
     model = getattr(config, "model_config", None)
     text_config = getattr(model, "hf_text_config", None)
@@ -120,6 +128,9 @@ def normalize_backend_request(config: Any, provider: Any) -> BackendRequest:
     additional = getattr(config, "additional_config", None)
     options = additional.get(BACKEND_OPTIONS_KEY, {}) if isinstance(additional, Mapping) else {}
     gr = GRConfig.from_vllm_config(config)
+    admission_geometry = getattr(provider, "beam_kv_geometry", None)
+    if gr.beam_max_decode_steps > 3 and admission_geometry is not None:
+        native["local_kv_heads"], native["head_size"] = admission_geometry(config)
     gr_fields = asdict(gr)
     gr_fields["beam_execution_mode"] = "v1" if gr.beam_max_width is not None else None
     return BackendRequest(
@@ -145,17 +156,12 @@ def resolve_backend_plan(provider: Any, request: BackendRequest) -> BackendPlan:
     return plan
 
 
-def normalize_worker_backend_request(
-    config: Any, provider: Any, admitted_plan: BackendPlan
+def _normalize_with_admitted_length(
+    config: Any, provider: Any, admitted_length: Any
 ) -> BackendRequest:
-    """Compare admission inputs while allowing native model-length autofit."""
     request = normalize_backend_request(config, provider)
     native = request.native.to_dict()
     model = native["model_config"]
-    admitted_model = admitted_plan.request.native.to_dict().get("model_config", {})
-    admitted_length = (
-        admitted_model.get("max_model_len") if isinstance(admitted_model, Mapping) else None
-    )
     actual_length = model["max_model_len"]
     if (
         type(admitted_length) is int
@@ -171,12 +177,42 @@ def normalize_worker_backend_request(
     return request
 
 
+def worker_plan_from_choices(
+    config: Any, expected: ResolvedChoices, *, provider: Any = None
+) -> BackendPlan:
+    """Verify local inputs and consume the choices admitted by the engine."""
+    from .loader import activate_current_backend
+
+    if provider is None:
+        provider = activate_current_backend()
+    request = _normalize_with_admitted_length(
+        config, provider, expected.limits.to_dict()["max_model_len"]
+    )
+    local = BackendPlan(
+        provider.backend_id,
+        provider.api_version,
+        request,
+        expected.choices,
+        requirements=expected.requirements,
+    )
+    if ResolvedChoices.from_plan(local) != expected:
+        raise RuntimeError(
+            "Worker backend plan mismatch: local platform, config or choices differ from engine admission"
+        )
+    return local
+
+
 def admit_backend_plan(config: Any) -> BackendPlan | None:
     """Attach only serializable plan data after EngineArgs has normalized GR."""
     from vllm_gr.config import GRConfig
 
     from .loader import activate_current_backend
 
+    additional = getattr(config, "additional_config", None)
+    if isinstance(additional, Mapping) and LEGACY_PLAN_KEY in additional:
+        raise ValueError(
+            "Unsupported legacy GR plan format; use the same vllm-gr version on the engine and workers"
+        )
     gr = GRConfig.from_vllm_config(config)
     if not gr.enabled and gr.beam_max_width is None:
         additional = getattr(config, "additional_config", None)
@@ -192,5 +228,8 @@ def admit_backend_plan(config: Any) -> BackendPlan | None:
     additional = getattr(config, "additional_config", None)
     if additional is not None and not isinstance(additional, Mapping):
         raise TypeError("Backend plans require mapping additional_config")
-    config.additional_config = {**(additional or {}), BACKEND_PLAN_KEY: plan.to_wire()}
+    config.additional_config = {
+        **(additional or {}),
+        BACKEND_PLAN_KEY: ResolvedChoices.from_plan(plan).to_wire(),
+    }
     return plan

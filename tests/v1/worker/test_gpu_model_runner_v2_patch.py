@@ -92,6 +92,7 @@ def test_apply_v2_runner_patches_stamps_markers(
     monkeypatch.setattr(v2, "make_load_model_with_constraint_backend", constraint_load)
     monkeypatch.setattr(v2, "discover_worker_runners", lambda: (("GPUModelRunnerV2", Runner),))
     v2._apply_v2_runner_patches()
+    assert v2.is_patched(Runner)
     assert constraint_load.call_args.kwargs["prepare_backend"] is v2._warmup_constraint_backend
 
     # Input preparation/registration have guarded GR specializations; native
@@ -206,17 +207,19 @@ def test_capture_order_and_failure_propagation(
     events = Mock()
     events.native.return_value = 17
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", events.plan)
-    monkeypatch.setattr(resources, "capture_multibatch_forward", events.decode)
     monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (4096, 8192))
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", events.freeze)
     expected = [call.native(worker)]
     if beam_enabled:
         expected.insert(0, call.plan(worker))
-        expected.append(call.decode(worker))
+        expected.append(call.decode(worker, True))
 
     def native(runner: Any) -> int:
         return cast(int, events.native(runner))
 
+    worker._gr_backend_binding = SimpleNamespace(
+        stage=SimpleNamespace(capture_startup=events.decode)
+    )
     wrapped = v2.make_patched_capture_model_v2(native)
     if failure:
         error = RuntimeError("operation not supported when stream is capturing")
@@ -238,6 +241,7 @@ def test_repeated_capture_preserves_published_decode_failure(
 ) -> None:
     from vllm_gr.v1.attention.backends import beam_prefix_calibrate
     from vllm_gr.v1.worker import gr_startup
+    from vllm_gr.v1.worker.cuda import stage_capture
     from vllm_gr.v1.worker.cuda.v2 import gpu_prefill_graph_runner_v2 as prefill
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
@@ -258,7 +262,7 @@ def test_repeated_capture_preserves_published_decode_failure(
 
     capture = Mock(side_effect=refuse)
     monkeypatch.setattr(gr_startup, "_capture_enabled", Mock(return_value=True))
-    monkeypatch.setattr(gr_startup, "_capture_batch", capture)
+    monkeypatch.setattr(stage_capture, "_capture_batch", capture)
     monkeypatch.setattr(beam_prefix_calibrate, "ensure_prefix_calibration", Mock())
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", Mock())
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", Mock())
@@ -267,6 +271,13 @@ def test_repeated_capture_preserves_published_decode_failure(
     def native(runner: Any) -> int:
         return 17
 
+    worker._gr_backend_binding = SimpleNamespace(
+        stage=SimpleNamespace(
+            capture_startup=lambda runner, fallback: resources.capture_multibatch_forward(
+                runner, allow_eager_fallback=fallback
+            )
+        )
+    )
     wrapped = v2.make_patched_capture_model_v2(native)
     for _ in range(2):
         assert wrapped(worker) == 17
@@ -318,16 +329,16 @@ def test_profile_capture_includes_decode_without_freezing(
     decode = Mock()
     freeze = Mock()
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", capturing_enabled)
-    decode.side_effect = lambda worker: monitor.set_cudagraph_capturing_enabled(False)
+    decode.side_effect = lambda worker, fallback: monitor.set_cudagraph_capturing_enabled(False)
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
-    monkeypatch.setattr(resources, "capture_multibatch_forward", decode)
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
     memory = iter((8192, 7168))
     monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (next(memory), 16384))
+    worker._gr_backend_binding = SimpleNamespace(stage=SimpleNamespace(capture_startup=decode))
     assert v2.make_patched_capture_model_v2(native)(worker, profile_only=profile_only) == 5120
     native.assert_called_once_with(worker, profile_only=profile_only)
     install.assert_called_once_with(worker)
-    decode.assert_called_once_with(worker)
+    decode.assert_called_once_with(worker, True)
     if profile_only:
         freeze.assert_not_called()
     else:
@@ -357,17 +368,17 @@ def test_profile_decode_failure_restores_native_capture_state(
     setattr(native, v2._WORKER_V2_GRAPH_PATCH_MARKER, False)
     install, freeze = Mock(), Mock()
 
-    def capture(runner: Any) -> bool:
+    def capture(runner: Any, allow_eager_fallback: bool) -> bool:
         assert runner is worker
         monitor.set_cudagraph_capturing_enabled(False)
         raise error
 
     monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", capturing_enabled)
     monkeypatch.setattr(prefill, "install_prefill_graph_manager_v2", install)
-    monkeypatch.setattr(resources, "capture_multibatch_forward", capture)
     monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (8192, 16384))
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
 
+    worker._gr_backend_binding = SimpleNamespace(stage=SimpleNamespace(capture_startup=capture))
     with pytest.raises(RuntimeError) as caught:
         v2.make_patched_capture_model_v2(native)(worker, profile_only=True)
     assert caught.value is error

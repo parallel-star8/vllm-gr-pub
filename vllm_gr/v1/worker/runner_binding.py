@@ -12,20 +12,17 @@ from functools import wraps
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
-from vllm_gr.config.backend_plan import (
-    BackendPlan,
-    read_backend_plan,
-)
-from vllm_gr.platforms.planning import (
-    normalize_worker_backend_request,
-    resolve_backend_plan,
-)
+from vllm_gr.config.backend_plan import BackendPlan
+from vllm_gr.config.resolved_choices import ResolvedChoices, read_resolved_choices
+from vllm_gr.platforms.planning import worker_plan_from_choices
 from vllm_gr.platforms.services import (
     BoundService,
     constraint_execution_override,
     planning_provider,
     validate_required_services,
 )
+from vllm_gr.v1.worker.runner_lifecycle import NativeRunnerAdapter
+from vllm_gr.v1.worker.stage_binding import StageBinding
 
 if TYPE_CHECKING:
     from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
@@ -38,7 +35,7 @@ _BINDING_ATTR = "_gr_backend_binding"
 def _beam_attention_layers(runner: Any) -> tuple[BeamAttentionImpl, ...]:
     """Only visit implementations owned by this model, including wrapped models."""
     model = getattr(runner, "model", None)
-    # Importing the facade registers CUSTOM. Other providers may own that slot.
+    # A model using native attention has no Beam implementation to bind.
     if model is None or "vllm_gr.v1.attention.backends.beam_attn" not in sys.modules:
         return ()
     get_model = getattr(runner, "get_model", None)
@@ -92,6 +89,8 @@ class BackendBinding:
 
     attention_layers: tuple[BeamAttentionImpl, ...] = ()
 
+    stage: StageBinding | None = None
+
     def detach_attention(self) -> None:
         for impl in self.attention_layers:
             if vars(impl).get("execution") is self.attention_executor:
@@ -103,6 +102,7 @@ class BackendBinding:
             "fingerprint": self.plan.fingerprint,
             "services": {
                 "runner": _implementation_id(self.runner_adapter),
+                **({"stage": self.stage.implementation_id} if self.stage is not None else {}),
                 "attention": _implementation_id(self.attention_executor),
                 "constraint": self.canonical_constraint_id
                 or _implementation_id(self.constraint_execution),
@@ -128,24 +128,18 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
     from vllm_gr.platforms.loader import activate_current_backend
 
     config = getattr(runner, "vllm_config", None)
-    plan = read_backend_plan(config)
-    if plan is None:
-        return None  # Unplanned native configs retain the pre-plan API path.
+    expected = read_resolved_choices(config)
+    if expected is None:
+        return None
     existing = getattr(runner, _BINDING_ATTR, None)
     if existing is not None:
         if not isinstance(existing, BackendBinding):
             raise RuntimeError("Runner contains an invalid backend binding")
-        if existing.plan != plan:
+        if ResolvedChoices.from_plan(existing.plan) != expected:
             raise RuntimeError("Runner backend plan changed; reload its owned resources first")
-        # Native KV-cache profiling may auto-fit max_model_len after model load.
-        # Readiness attests the admitted plan and the services already bound.
         return existing
     provider = activate_current_backend()
-    local = resolve_backend_plan(provider, normalize_worker_backend_request(config, provider, plan))
-    if local.fingerprint != plan.fingerprint:
-        raise RuntimeError(
-            f"Worker backend plan mismatch: engine={plan.fingerprint}, worker={local.fingerprint}"
-        )
+    plan = worker_plan_from_choices(config, expected, provider=provider)
     selected = planning_provider(provider)
     selected.validate_worker(plan=plan, native_runner=runner)
     required = plan.required_services
@@ -193,8 +187,17 @@ def bind_backend_services(runner: Any) -> BackendBinding | None:
         layers = _beam_attention_layers(runner) if attention is not None else ()
         for impl in layers:
             impl.validate_execution(attention)
+        stage = None
+        if isinstance(adapter, NativeRunnerAdapter):
+            installed = getattr(type(runner), "_gr_stage_binding", None)
+            expected = plan.choices.to_dict().get("stage")
+            if installed is not None and expected is not None:
+                if installed.implementation_id != expected:
+                    raise RuntimeError("Installed stage differs from the admitted backend plan")
+                adapter.bind_stage_sampler(runner, installed)
+                stage = installed
         binding = BackendBinding(
-            plan, adapter, attention, constraint, _implementation_id(canonical), layers
+            plan, adapter, attention, constraint, _implementation_id(canonical), layers, stage
         )
         validate_required_services(plan, required, binding.report()["services"], "Backend worker")
         for impl in layers:
@@ -220,13 +223,23 @@ def bind_after_model_load(
 
     @wraps(original)
     def load(self: Any, *args: Any, **kwargs: Any) -> Any:
+        existing = getattr(self, _BINDING_ATTR, None)
+        if (
+            existing is not None
+            and existing.stage is not None
+            and existing.runner_adapter.pending_stage_sample is not False
+        ):
+            raise RuntimeError("GR sampling must consume the previous dispatch before model reload")
         if close_runtime is not None:
             # Reject undrained native work before replacing the current generation.
             close_runtime(self)
-        if getattr(self, _BINDING_ATTR, None) is not None:
+        if existing is not None:
             # A full load constructs a new model even when its plan is unchanged.
             close_backend_binding(self)
         try:
+            from vllm_gr.v1.attention.selector_patch import prepare_engine_attention
+
+            prepare_engine_attention(getattr(self, "vllm_config", None))
             result = original(self, *args, **kwargs)
             bind_backend_services(self)
         except BaseException:

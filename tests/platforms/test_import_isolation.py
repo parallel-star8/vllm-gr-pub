@@ -261,7 +261,7 @@ pytestmark = pytest.mark.cpu_test
 def test_runner_contracts_import_stays_hardware_free() -> None:
     code = """
 import sys
-from vllm_gr.v1.worker import cuda, model_runner_contracts, npu
+from vllm_gr.v1.worker import cuda, model_runner_contracts, npu, stage_binding
 from vllm_gr.v1.worker.cuda import v1, v2
 
 for package in (cuda, v1, v2, npu):
@@ -271,6 +271,7 @@ for package in (cuda, v1, v2, npu):
         for name in sys.modules
     )
 assert callable(model_runner_contracts.is_worker_runner_patched)
+assert callable(stage_binding.StageBinding)
 for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
              "vllm_gr.v1.worker.model_runner_common",
              "vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_patch"):
@@ -284,3 +285,34 @@ for name in ("torch", "vllm", "torch_npu", "vllm_ascend",
         check=True,
         timeout=120,
     )
+
+
+@pytest.mark.l1  # type: ignore[misc]
+def test_shared_execution_imports_no_platform_implementation() -> None:
+    code = """
+import importlib
+import os
+import sys
+
+# Exercise GR imports independently of third-party plugin autoload on the host.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+os.environ["VLLM_PLUGINS"] = ""
+
+for suffix in (
+    "worker.gr_execution",
+    "worker.model_runner_common",
+    "worker.model_runner_patch",
+    "worker.gr_startup",
+    "worker.runner_binding",
+    "engine.worker_readiness",
+):
+    importlib.import_module("vllm_gr.v1." + suffix)
+
+unexpected = [
+    name for name in sys.modules
+    if name.startswith(("vllm_gr.v1.worker.cuda.", "vllm_gr.v1.worker.npu."))
+    or name == "torch_npu" or name.startswith("torch_npu.")
+]
+assert not unexpected, unexpected
+"""
+    subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, check=True, timeout=120)

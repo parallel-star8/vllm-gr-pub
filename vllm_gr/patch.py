@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from vllm_gr.v1.attention import selector_patch
 from vllm_gr.v1.worker import sliced_logits_patch
 
 if TYPE_CHECKING:
@@ -29,7 +28,6 @@ logger = logging.getLogger("vllm_gr.patch")
 # rationale in docs/design/runtime_patch_inventory.md.
 CORE_PATCH_IDS = (
     "GR-PATCH-000",
-    "GR-PATCH-001",
     "GR-PATCH-003",
     "GR-PATCH-004",
     "GR-PATCH-005",
@@ -293,9 +291,6 @@ def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" 
 
         # Fresh workers can call this before provider activation.
         provider = activate_current_backend()
-    # CUSTOM selection is shared by CUDA and Ascend. Install it before a
-    # provider imports its native worker; it must not become an NPU-only hook.
-    attention_count = selector_patch.apply_custom_attention_backend_patch(force=force)
     try:
         # The selected provider installs its early hooks before the Beam
         # plan can discover ModelRunner classes or create worker processes.
@@ -306,7 +301,7 @@ def _apply_patches(force: bool = False, *, provider: "GRBackendProvider | None" 
             "initialization may be partial, restart the process"
         ) from exc
     beam_count = _apply_gr_beam_patches()
-    return attention_count + backend_count + beam_count
+    return backend_count + beam_count
 
 
 def re_apply_patches(*, provider: "GRBackendProvider | None" = None) -> int:
