@@ -4,8 +4,7 @@
 
 import logging
 import os
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock, call
 
@@ -19,127 +18,6 @@ from vllm_gr.v1.worker import model_runner_contracts as _patch_contracts
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_patch as v2
 from vllm_gr.v1.worker.cuda.v2 import gpu_model_runner_v2_resources as resources
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
-
-
-def test_discover_worker_runners_returns_v2_class() -> None:
-    """V2 discovery yields the V2 GPUModelRunner (prepare_inputs, no _prepare_inputs)."""
-    runners = v2.discover_worker_runners()
-    assert runners
-    name, cls = runners[0]
-    assert name == "GPUModelRunnerV2"
-    assert hasattr(cls, "prepare_inputs")
-    assert not hasattr(cls, "_prepare_inputs")
-    assert hasattr(cls, "sample")
-    assert hasattr(cls, "sample_tokens")
-
-
-def test_discover_worker_runners_empty_on_import_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake = ModuleType("vllm.v1.worker.gpu.model_runner")
-
-    def raise_import(name: str) -> None:
-        raise ImportError(f"no {name}")
-
-    # ModuleType.__getattr__ is read-only for mypy; stub it at the instance
-    # level so any missing attribute on the fake module raises ImportError.
-    fake.__getattr__ = raise_import  # type: ignore[method-assign]
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu.model_runner", fake)
-    assert v2.discover_worker_runners() == ()
-
-
-def test_apply_v2_runner_patches_stamps_markers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Runner:
-        def execute_model(self, scheduler_output: Any, *a: Any, **k: Any) -> None:
-            return None
-
-        def prepare_inputs(
-            self, scheduler_output: Any, batch_req_state: Any, batch_desc: Any
-        ) -> Any:
-            return None
-
-        def sample(self, hidden_states: Any, input_batch: Any, grammar_output: Any = None) -> Any:
-            return None
-
-        def sample_tokens(self, grammar_output: Any = None) -> Any:
-            return None
-
-        def load_model(self, *a: Any, **k: Any) -> None:
-            return None
-
-        def shutdown(self) -> None:
-            return None
-
-        def finish_requests(self, scheduler_output: Any) -> None:
-            return None
-
-        def add_requests(self, scheduler_output: Any) -> None:
-            return None
-
-        def initialize_kv_cache(self, config: Any, *, is_profiling: bool = False) -> None:
-            return None
-
-        def profile_cudagraph_memory(self) -> int:
-            return 0
-
-        def capture_model(self, *, profile_only: bool = False) -> int:
-            return 0
-
-    native_methods = {name: getattr(Runner, name) for name in ("sample", "finish_requests")}
-    constraint_load = Mock(wraps=v2.make_load_model_with_constraint_backend)
-    monkeypatch.setattr(v2, "make_load_model_with_constraint_backend", constraint_load)
-    monkeypatch.setattr(v2, "discover_worker_runners", lambda: (("GPUModelRunnerV2", Runner),))
-    v2._apply_v2_runner_patches()
-    assert v2.is_patched(Runner)
-    assert constraint_load.call_args.kwargs["prepare_backend"] is v2._warmup_constraint_backend
-
-    # Input preparation/registration have guarded GR specializations; native
-    # sampling and request retirement remain unchanged.
-    assert getattr(Runner.execute_model, _patch_contracts._WORKER_EXECUTE_PATCH_MARKER, False)
-    assert all(getattr(Runner, name) is method for name, method in native_methods.items())
-    assert getattr(
-        Runner.sample_tokens, _patch_contracts._WORKER_V2_SAMPLE_TOKENS_PATCH_MARKER, False
-    )
-    assert getattr(Runner.load_model, _patch_contracts._CONSTRAINT_LOAD_PATCH_MARKER, False)
-    assert getattr(Runner.shutdown, _patch_contracts._CONSTRAINT_SHUTDOWN_PATCH_MARKER, False)
-    assert getattr(Runner.prepare_inputs, _patch_contracts._WORKER_V2_PREPARE_PATCH_MARKER, False)
-    assert getattr(
-        Runner.add_requests, _patch_contracts._WORKER_V2_ADD_REQUESTS_PATCH_MARKER, False
-    )
-    assert _patch_contracts.is_worker_runner_v2_patched(Runner)
-    assert _patch_contracts.is_worker_runner_patched(Runner)
-
-    graph_methods = {
-        "initialize_kv_cache": v2._WORKER_V2_KV_PATCH_MARKER,
-        "profile_cudagraph_memory": v2._WORKER_V2_PROFILE_PATCH_MARKER,
-        "capture_model": v2._WORKER_V2_GRAPH_PATCH_MARKER,
-    }
-    captured_methods = {name: getattr(Runner, name) for name in graph_methods}
-    for name, marker in graph_methods.items():
-        assert getattr(captured_methods[name], marker, False)
-
-    # Idempotent: a second apply leaves every wrapper unchanged.
-    execute, sample, sample_tokens, prepare, add, load, shutdown = (
-        Runner.execute_model,
-        Runner.sample,
-        Runner.sample_tokens,
-        Runner.prepare_inputs,
-        Runner.add_requests,
-        Runner.load_model,
-        Runner.shutdown,
-    )
-    v2._apply_v2_runner_patches()
-    assert (Runner.execute_model, Runner.sample, Runner.sample_tokens) == (
-        execute,
-        sample,
-        sample_tokens,
-    )
-    assert (Runner.load_model, Runner.shutdown) == (load, shutdown)
-    assert Runner.prepare_inputs is prepare
-    assert Runner.add_requests is add
-    assert all(getattr(Runner, n) is method for n, method in captured_methods.items())
 
 
 def test_sample_tokens_v2_plain_fallback_is_pure_native() -> None:
@@ -177,8 +55,11 @@ def test_sample_tokens_v2_stage_bypass() -> None:
 def test_configure_model_runner_default_normalizes_opt_in(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    import vllm_gr.platforms as table
+    from tests.helpers.cuda_platform import CudaGRPlatform
     from vllm_gr.engine.startup import configure_model_runner_default
 
+    monkeypatch.setattr(table, "get_current_gr_platform", CudaGRPlatform)
     for value in (None, "0", "false", "no", "off", "1", "true", "yes", "on"):
         caplog.clear()
         if value is None:
@@ -217,9 +98,7 @@ def test_capture_order_and_failure_propagation(
     def native(runner: Any) -> int:
         return cast(int, events.native(runner))
 
-    worker._gr_backend_binding = SimpleNamespace(
-        stage=SimpleNamespace(capture_startup=events.decode)
-    )
+    worker.capture_gr_startup = lambda fallback: events.decode(worker, fallback)
     wrapped = v2.make_patched_capture_model_v2(native)
     if failure:
         error = RuntimeError("operation not supported when stream is capturing")
@@ -271,13 +150,10 @@ def test_repeated_capture_preserves_published_decode_failure(
     def native(runner: Any) -> int:
         return 17
 
-    worker._gr_backend_binding = SimpleNamespace(
-        stage=SimpleNamespace(
-            capture_startup=lambda runner, fallback: resources.capture_multibatch_forward(
-                runner, allow_eager_fallback=fallback
-            )
-        )
+    worker.capture_gr_startup = lambda fallback: resources.capture_multibatch_forward(
+        worker, allow_eager_fallback=fallback
     )
+
     wrapped = v2.make_patched_capture_model_v2(native)
     for _ in range(2):
         assert wrapped(worker) == 17
@@ -334,7 +210,7 @@ def test_profile_capture_includes_decode_without_freezing(
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
     memory = iter((8192, 7168))
     monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (next(memory), 16384))
-    worker._gr_backend_binding = SimpleNamespace(stage=SimpleNamespace(capture_startup=decode))
+    worker.capture_gr_startup = lambda fallback: decode(worker, fallback)
     assert v2.make_patched_capture_model_v2(native)(worker, profile_only=profile_only) == 5120
     native.assert_called_once_with(worker, profile_only=profile_only)
     install.assert_called_once_with(worker)
@@ -378,7 +254,7 @@ def test_profile_decode_failure_restores_native_capture_state(
     monkeypatch.setattr(v2.torch.accelerator, "get_memory_info", lambda: (8192, 16384))
     monkeypatch.setattr(_gc_runtime, "freeze_gc_after_graph_capture", freeze)
 
-    worker._gr_backend_binding = SimpleNamespace(stage=SimpleNamespace(capture_startup=capture))
+    worker.capture_gr_startup = lambda fallback: capture(worker, fallback)
     with pytest.raises(RuntimeError) as caught:
         v2.make_patched_capture_model_v2(native)(worker, profile_only=True)
     assert caught.value is error

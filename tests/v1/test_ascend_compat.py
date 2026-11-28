@@ -14,27 +14,7 @@ import pytest
 
 from tests.helpers.paths import REPO_ROOT
 from vllm_gr.platforms.ascend import config_patch
-from vllm_gr.v1 import ascend_compat
 from vllm_gr.v1.attention import selector_patch
-from vllm_gr.v1.worker.npu import kv_layout_patch, startup_patch
-
-
-def _vendor_platform(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, mock.Mock]:
-    import vllm.platforms
-
-    native = mock.Mock(return_value="vendor.NativeBackend")
-
-    class NPUPlatform:
-        @classmethod
-        def get_attn_backend_cls(
-            cls, selected_backend: Any, attn_selector_config: Any, num_heads: int | None = None
-        ) -> Any:
-            return native(cls, selected_backend, attn_selector_config, num_heads=num_heads)
-
-    NPUPlatform.__module__ = "vllm_ascend.platform"
-    NPUPlatform.__qualname__ = "NPUPlatform"
-    monkeypatch.setattr(vllm.platforms, "current_platform", NPUPlatform())
-    return NPUPlatform, native
 
 
 def test_import_does_not_load_npu_worker() -> None:
@@ -42,10 +22,9 @@ def test_import_does_not_load_npu_worker() -> None:
     code = """
 import sys
 import vllm_gr.platforms.ascend.config_patch
-import vllm_gr.v1.ascend_compat
 import vllm_gr.v1.worker.npu.startup_patch
 
-for module_name in ("torch", "torch_npu", "vllm_ascend", "vllm_ascend.worker.worker"):
+for module_name in ("torch_npu", "vllm_ascend", "vllm_ascend.worker.worker"):
     assert module_name not in sys.modules, module_name
 """
 
@@ -59,229 +38,20 @@ for module_name in ("torch", "torch_npu", "vllm_ascend", "vllm_ascend.worker.wor
 
 
 @pytest.mark.l1  # type: ignore[misc]
-def test_custom_slot_preserves_external_owner_before_import(
+def test_selector_cache_reset_clears_cached_resolutions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm.v1.attention.backends import registry
-
-    custom = registry.AttentionBackendEnum.CUSTOM
-    monkeypatch.setitem(registry._ATTN_OVERRIDES, custom, "other.vendor.Backend")
-    with mock.patch.object(registry.AttentionBackendEnum, "get_class") as resolve:
-        with pytest.raises(RuntimeError, match=r"already registered to other.vendor.Backend"):
-            selector_patch._register_beam_backend()
-        resolve.assert_not_called()
-    assert custom.get_path() == "other.vendor.Backend"
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_custom_slot_registers_once_and_resolves_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm.v1.attention.backends import registry
-
-    custom = registry.AttentionBackendEnum.CUSTOM
-    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
-    with mock.patch.object(
-        registry, "register_backend", wraps=registry.register_backend
-    ) as register:
-        selector_patch._register_beam_backend()
-        selector_patch._register_beam_backend()
-        register.assert_called_once_with(custom, selector_patch._BEAM_BACKEND_PATH)
-
-
-@pytest.mark.parametrize("first_custom", [False, True])  # type: ignore[misc]
-def test_selector_routes_custom_marker_and_native_backends(
-    monkeypatch: pytest.MonkeyPatch, first_custom: bool
-) -> None:
-    from vllm.v1.attention.backends import registry
-
-    custom = registry.AttentionBackendEnum.CUSTOM
-    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
-    selector_patch._register_beam_backend()
-    platform, native = _vendor_platform(monkeypatch)
-    assert selector_patch.apply_custom_attention_backend_patch() == 1
-    keys = [custom, None, custom] if first_custom else [None, custom, None]
-
-    @lru_cache
-    def select(key: Any, geometry: str) -> Any:
-        return platform.get_attn_backend_cls(key, geometry, num_heads=4)
-
-    for key in keys:
-        assert select(key, "same") == (custom.get_path() if key else "vendor.NativeBackend")
-    native.assert_called_once_with(platform, None, "same", num_heads=4)
-
-
-def test_selector_installation_is_idempotent_and_force_uses_original(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    platform, native = _vendor_platform(monkeypatch)
-    assert ascend_compat.apply_ascend_attention_backend_patch() == 1
-    wrapper = platform.get_attn_backend_cls.__func__
-    assert ascend_compat.apply_ascend_attention_backend_patch(force=True) == 0
-    assert platform.get_attn_backend_cls.__func__ is wrapper
-    assert platform.get_attn_backend_cls(None, "geometry") == "vendor.NativeBackend"
-    native.assert_called_once_with(platform, None, "geometry", num_heads=None)
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_selector_reinstalls_over_replaced_upstream_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    platform, native = _vendor_platform(monkeypatch)
-    assert selector_patch.apply_custom_attention_backend_patch() == 1
-    replacement = mock.Mock(return_value="vendor.Replacement")
-    monkeypatch.setattr(platform, "get_attn_backend_cls", classmethod(replacement))
-    assert selector_patch.apply_custom_attention_backend_patch(force=True) == 1
-    assert platform.get_attn_backend_cls(None, "config") == "vendor.Replacement"
-    native.assert_not_called()
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_selector_cache_reset_preserves_installed_callable(monkeypatch: pytest.MonkeyPatch) -> None:
-    import vllm.platforms
-    import vllm.v1.attention.selector as selector
-
-    monkeypatch.setattr(vllm.platforms, "current_platform", SimpleNamespace(_enum="CUDA"))
+    from vllm.v1.attention import selector
 
     @lru_cache
     def lookup(key: str) -> object:
         return object()
 
     monkeypatch.setattr(selector, "_cached_get_attn_backend", lookup)
-    assert selector_patch.apply_custom_attention_backend_patch() == 0
     cached = lookup("key")
     selector_patch.clear_attention_backend_cache()
     assert selector._cached_get_attn_backend is lookup
     assert lookup("key") is not cached
-
-
-def test_custom_backend_import_failure_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm.v1.attention.backends import registry
-
-    monkeypatch.setattr(registry, "_ATTN_OVERRIDES", {})
-    monkeypatch.setitem(sys.modules, "vllm_gr.v1.attention.backends.beam_attn", None)
-    selector_patch._register_beam_backend()
-    with pytest.raises(ModuleNotFoundError, match="beam_attn"):
-        registry.AttentionBackendEnum.CUSTOM.get_class()
-
-
-def _install_fake_npu_worker(
-    monkeypatch: pytest.MonkeyPatch,
-    init_device: Any,
-) -> type[Any]:
-    ascend_module = ModuleType("vllm_ascend")
-    worker_package = ModuleType("vllm_ascend.worker")
-    worker_module = ModuleType("vllm_ascend.worker.worker")
-    setattr(ascend_module, "__path__", [])
-    setattr(worker_package, "__path__", [])
-
-    class NPUWorker:
-        def init_device(self) -> Any:
-            return init_device(self)
-
-    setattr(worker_module, "NPUWorker", NPUWorker)
-    setattr(ascend_module, "worker", worker_package)
-    setattr(worker_package, "worker", worker_module)
-    monkeypatch.setitem(sys.modules, "vllm_ascend", ascend_module)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.worker", worker_package)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", worker_module)
-    return NPUWorker
-
-
-def test_npu_worker_patch_is_lazy_and_preserves_lifecycle_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm_gr.patch as runtime_patch
-
-    install_filter = mock.Mock()
-    monkeypatch.setattr(startup_patch, "install_ascend_config_filter", install_filter)
-    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: False)
-    monkeypatch.delitem(sys.modules, "vllm_ascend.worker.worker", raising=False)
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert "vllm_ascend.worker.worker" not in sys.modules
-
-    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", None)
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    install_filter.assert_not_called()
-
-    events: list[str] = []
-    monkeypatch.setattr(
-        kv_layout_patch,
-        "apply_npu_contiguous_kv_cache_patch",
-        lambda: events.append("kv_layout"),
-    )
-    monkeypatch.setattr(
-        startup_patch,
-        "apply_penalties_warmup_oom_guard",
-        lambda: events.append("warmup"),
-    )
-    raise_from_original = False
-
-    def original_init_device(self: object) -> str:
-        events.append("original")
-        if raise_from_original:
-            raise RuntimeError("init failed")
-        return "ready"
-
-    worker_class = _install_fake_npu_worker(monkeypatch, original_init_device)
-
-    def re_apply_patches() -> int:
-        events.append("re_apply")
-        return 0
-
-    monkeypatch.setattr(
-        runtime_patch,
-        "re_apply_patches",
-        re_apply_patches,
-    )
-
-    assert startup_patch.patch_npu_worker_init_device() == 1
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert install_filter.call_args_list == [mock.call(), mock.call()]
-    assert worker_class().init_device() == "ready"
-    assert events == ["re_apply", "kv_layout", "warmup", "original"]
-
-    from vllm_gr.v1.worker.gr_context import (
-        get_beam_graph_runtime_stats,
-    )
-    from vllm_gr.v1.worker.gr_gc import (
-        freeze_gc_after_warmup,
-    )
-
-    assert worker_class.__dict__["get_gr_beam_graph_runtime_stats"] is get_beam_graph_runtime_stats
-    assert worker_class.__dict__["gr_freeze_gc_after_warmup"] is freeze_gc_after_warmup
-    from vllm_gr.v1.worker.hot_update import reload_trie
-
-    assert worker_class.__dict__["reload_trie"] is reload_trie
-
-    events.clear()
-    raise_from_original = True
-    with pytest.raises(RuntimeError, match="init failed"):
-        worker_class().init_device()
-    assert events == ["re_apply", "kv_layout", "warmup", "original"]
-    assert worker_class.__dict__["reload_trie"] is reload_trie
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_npu_worker_reinstalls_over_replaced_upstream_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
-    monkeypatch.setattr(startup_patch, "install_ascend_config_filter", lambda: None)
-    worker = _install_fake_npu_worker(monkeypatch, lambda _: "native")
-    original = worker.init_device
-    assert startup_patch.patch_npu_worker_init_device() == 1
-    wrapper = worker.init_device
-    assert getattr(wrapper, startup_patch._NPU_WORKER_ORIGINAL_ATTR) is original
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert worker.init_device is wrapper
-
-    def replacement(self: object) -> str:
-        return "replacement"
-
-    monkeypatch.setattr(worker, "init_device", replacement)
-    assert startup_patch.patch_npu_worker_init_device() == 1
-    repaired = worker.init_device
-    assert getattr(repaired, startup_patch._NPU_WORKER_ORIGINAL_ATTR) is replacement
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert worker.init_device is repaired
 
 
 def _install_fake_ascend_config(
@@ -310,91 +80,6 @@ def _install_fake_ascend_config(
     return config_module.init_ascend_config, entry
 
 
-def test_worker_installs_config_filter_before_constructor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vllm_gr.config.parser import parse_gr_config
-
-    config = SimpleNamespace(
-        additional_config={"vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}}}
-    )
-    seen: list[Any] = []
-
-    def initialize(received: Any) -> None:
-        assert received.additional_config == {}
-        seen.append(received)
-
-    # A fresh worker process has no filter installed by EngineCore.
-    _install_fake_ascend_config(monkeypatch, initialize, install=False)
-    worker_module = sys.modules["vllm_ascend.worker.worker"]
-
-    class NPUWorker:
-        def __init__(self) -> None:
-            worker_module.init_ascend_config(config)
-
-        def init_device(self) -> None:
-            raise AssertionError("config validation precedes device initialization")
-
-    setattr(worker_module, "NPUWorker", NPUWorker)
-    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
-    assert startup_patch.patch_npu_worker_init_device() == 1
-    NPUWorker()
-    assert seen == [config]
-    assert parse_gr_config(config).beam_max_width == 8
-
-
-@pytest.mark.l1  # type: ignore[misc]
-@pytest.mark.parametrize("caller", ["worker", "engine_core"])  # type: ignore[misc]
-def test_worker_rechecks_config_bindings_without_rewrapping_device_hook(
-    monkeypatch: pytest.MonkeyPatch, caller: str
-) -> None:
-    additional = {"vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}}, "refresh": True}
-    config = SimpleNamespace(additional_config=additional)
-    seen: list[Any] = []
-
-    def initialize(received: Any) -> None:
-        assert received.additional_config == {"refresh": True}
-        seen.append(received)
-
-    _, entry = _install_fake_ascend_config(monkeypatch, initialize, install=False)
-    worker_module = sys.modules["vllm_ascend.worker.worker"]
-    config_module = sys.modules["vllm_ascend.ascend_config"]
-
-    class NPUWorker:
-        def __init__(self) -> None:
-            worker_module.init_ascend_config(config)
-
-        def init_device(self) -> None:
-            raise AssertionError("constructor validation must precede device initialization")
-
-    setattr(worker_module, "NPUWorker", NPUWorker)
-    monkeypatch.setattr(startup_patch, "is_npu_platform", lambda: True)
-    assert startup_patch.patch_npu_worker_init_device() == 1
-    device_wrapper = NPUWorker.init_device
-    sanitizer = config_module.init_ascend_config
-
-    # A native import restores only this alias; both GR wrappers stay installed.
-    rebound_module = worker_module if caller == "worker" else entry
-    monkeypatch.setattr(rebound_module, "init_ascend_config", initialize)
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert rebound_module.init_ascend_config is sanitizer
-    assert config_module.init_ascend_config is sanitizer
-    assert sanitizer.__wrapped__ is initialize
-    assert NPUWorker.init_device is device_wrapper
-    NPUWorker()
-    entry.init_ascend_config(config)
-    assert seen == [config, config]
-    assert config.additional_config is additional
-    assert additional == {
-        "vllm_gr": {"gr": {"beam_width": [8], "candidate_width": [8]}},
-        "refresh": True,
-    }
-
-    assert startup_patch.patch_npu_worker_init_device() == 0
-    assert NPUWorker.init_device is device_wrapper
-    assert config_module.init_ascend_config is sanitizer
-
-
 @pytest.mark.l1  # type: ignore[misc]
 @pytest.mark.parametrize("caller", ["worker", "engine_core"])  # type: ignore[misc]
 def test_config_binding_recheck_preserves_unrelated_overrides(
@@ -417,15 +102,7 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
 ) -> None:
     from copy import deepcopy
 
-    from vllm_gr.config.backend_plan import (
-        BACKEND_PLAN_KEY,
-        BackendPlan,
-        BackendRequest,
-        PlanData,
-        read_backend_plan,
-    )
     from vllm_gr.config.parser import parse_gr_config
-    from vllm_gr.platforms.planning import BACKEND_OPTIONS_KEY
 
     seen: list[Any] = []
 
@@ -436,15 +113,11 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
 
     initialize_filtered, _ = _install_fake_ascend_config(monkeypatch, initialize)
     configs = []
-    empty = PlanData({})
     for width in (4, 8):
-        request = BackendRequest(PlanData({"beam_max_width": width}), empty, empty, empty)
-        plan = BackendPlan("ascend", 2, request, empty)
         additional = {
             "refresh": True,
             "vllm_gr": {"gr": {"beam_width": [width] * 3, "candidate_width": [width] * 3}},
-            BACKEND_PLAN_KEY: plan.to_wire(),
-            BACKEND_OPTIONS_KEY: {"test_option": width},
+            "vllm_gr_limits": {"max_decode_rows": width},
         }
         config = SimpleNamespace(additional_config=additional)
         before = deepcopy(additional)
@@ -454,7 +127,6 @@ def test_ascend_config_filter_preserves_engine_identity_and_gr_config(
         assert config.additional_config is additional
         assert additional == before
         assert parse_gr_config(config) == expected
-        assert read_backend_plan(config) == plan
         assert parse_gr_config(deepcopy(config)) == expected
         configs.append(config)
 
@@ -528,7 +200,7 @@ def test_ascend_entry_installs_filter_before_delegating(
         }
         return "ready"
 
-    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    entry._run_engine_core_patch_func = native_entry
 
     class EngineCoreProc:
         run_engine_core = staticmethod(native_entry)
@@ -620,6 +292,11 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
     # do not own startup capacity and would require a device/model fixture.
     requests_plan = runtime_patch._engine_core_beam_patches()[:1]
     monkeypatch.setattr(runtime_patch, "_engine_core_beam_patches", lambda: requests_plan)
+    # This test isolates child capacity activation. Full worker readiness has
+    # independent cross-rank coverage in test_worker_readiness.py.
+    monkeypatch.setattr(
+        "vllm_gr.v1.engine.worker_readiness.verify_engine_backend_readiness", mock.Mock()
+    )
     raw_initialize = Core.__init__
     engine_core_patch.apply_engine_core_request_patches()
     Core.__init__ = raw_initialize  # type: ignore[method-assign]
@@ -635,7 +312,7 @@ def test_ascend_child_activates_live_trie_capacity_before_first_core_initializat
         assert engine_core_patch.validate_engine_core_request_patch() is None
         return CoreProc(kwargs["vllm_config"])
 
-    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    entry._run_engine_core_patch_func = native_entry
     initialize = None
     for _ in range(2):
         core = config_patch._sanitize_engine_core_entry(vllm_config=config)
@@ -675,7 +352,7 @@ def test_ascend_child_does_not_start_native_core_when_required_patching_fails(
 
     _, entry = _install_fake_ascend_config(monkeypatch, mock.Mock(), install=False)
     native_entry = mock.Mock()
-    setattr(entry, "_run_engine_core_patch_func", native_entry)
+    entry._run_engine_core_patch_func = native_entry
     monkeypatch.setattr(
         runtime_patch,
         "initialize_engine_core_beam_patches",

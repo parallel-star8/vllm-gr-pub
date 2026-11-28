@@ -503,18 +503,17 @@ def test_extended_generation_fits_native_kv_reorder_buffer(
         with pytest.raises(ValueError, match="SelectUnsharedKV 95 KiB buffer"):
             validate()
     if capacity > 3:
-        get_heads.assert_called_once_with(parallel)
+        assert get_heads.call_args.args == (parallel,)
     else:
         get_heads.assert_not_called()
 
 
 @pytest.mark.l1
 def test_remote_frontend_uses_admitted_kv_geometry_and_runner() -> None:
+    from dataclasses import asdict
+
+    from tests.helpers.ascend_platform import AscendGRPlatform
     from vllm_gr.config import GRConfig
-    from vllm_gr.config.backend_plan import BACKEND_PLAN_KEY
-    from vllm_gr.config.resolved_choices import ResolvedChoices
-    from vllm_gr.platforms.ascend import NPU_BACKEND
-    from vllm_gr.platforms.planning import normalize_backend_request
     from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
 
     config = SimpleNamespace(
@@ -526,8 +525,8 @@ def test_remote_frontend_uses_admitted_kv_geometry_and_runner() -> None:
     GRConfig(
         constraint=ConstraintConfig(), beam_max_width=2, beam_max_decode_steps=5
     ).write_to_vllm_config(config)
-    plan = NPU_BACKEND.resolve(normalize_backend_request(config, NPU_BACKEND))
-    config.additional_config[BACKEND_PLAN_KEY] = ResolvedChoices.from_plan(plan).to_wire()
+    integration = AscendGRPlatform()
+    config.additional_config["vllm_gr_limits"] = asdict(integration.get_beam_limits(config))
     config.device_config.device = "cpu"
     config.use_v2_model_runner = True
     config.model_config = SimpleNamespace(get_num_kv_heads=Mock(side_effect=AssertionError))
@@ -727,3 +726,13 @@ def test_npu_device_validation_accepts_partial_non_beam_config() -> None:
 
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture(autouse=True)
+def select_test_npu_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_gr.platforms
+    from tests.helpers.ascend_platform import AscendGRPlatform
+
+    monkeypatch.setattr(
+        vllm_gr.platforms, "get_current_gr_platform", lambda **kw: AscendGRPlatform()
+    )

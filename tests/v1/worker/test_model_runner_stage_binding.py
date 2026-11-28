@@ -22,14 +22,17 @@ def _unexpected_native(*args: object, **kwargs: object) -> None:
 
 
 def _bind_cuda_stage(worker: SimpleNamespace, use_v2: bool) -> None:
-    stage = stages.make_cuda_stage_binding(
-        "cuda.v2" if use_v2 else "cuda.v1",
-        CudaStageHooksV2 if use_v2 else CudaStageHooksV1,
-        Mock(),
+    from functools import partial
+
+    worker._gr_ready = True
+    worker._gr_pending_stage_sample = False
+    worker.execute_gr_stage = partial(
+        stages.execute_cuda_stage,
+        worker,
+        hooks_type=CudaStageHooksV2 if use_v2 else CudaStageHooksV1,
     )
-    worker._gr_backend_binding = SimpleNamespace(
-        stage=stage, runner_adapter=SimpleNamespace(pending_stage_sample=False)
-    )
+    worker.retire_gr_stage = partial(stages.execute_gr_retirement, worker)
+    worker.cancel_finished_gr = partial(stages.cancel_finished_stage, worker)
 
 
 def _scheduled_frame(**metadata: object) -> SimpleNamespace:
@@ -108,63 +111,9 @@ def test_cuda_dispatch_requires_bound_stage(monkeypatch: pytest.MonkeyPatch) -> 
 
     get_owner = Mock(side_effect=AssertionError("unbound dispatch allocated an owner"))
     monkeypatch.setattr(stages, "get_stage_runner", get_owner)
-    with pytest.raises(RuntimeError, match="before the runner bound"):
+    with pytest.raises(RuntimeError, match="before model initialization"):
         execute_gr_stage(SimpleNamespace(device="cuda"), _scheduled_frame(), _unexpected_native)
     get_owner.assert_not_called()
-
-
-@pytest.mark.l1  # type: ignore[misc]
-def test_v1_installer_binds_execution_and_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_gr.v1.worker import model_runner_patch
-    from vllm_gr.v1.worker.cuda import runner_installer as cuda
-    from vllm_gr.v1.worker.cuda import stage_capture as gr_startup
-    from vllm_gr.v1.worker.cuda.v1 import gpu_model_runner_patch
-
-    class Runner:
-        device = "cuda"
-        vllm_config = SimpleNamespace(
-            additional_config={
-                "vllm_gr": {"gr": {"beam_width": [128] * 3, "candidate_width": [128] * 3}}
-            }
-        )
-        execute_model = _unexpected_native
-        _prepare_inputs = _unexpected_native
-        _bookkeeping_sync = _unexpected_native
-
-        def capture_model(self) -> str:
-            return "native capture"
-
-    monkeypatch.setattr(model_runner_patch, "get_runner_hooks", lambda: gpu_model_runner_patch)
-    monkeypatch.setattr(gpu_model_runner_patch, "capture_prefill_graphs", lambda _: None)
-    monkeypatch.setattr(cuda, "install_worker_hooks", lambda: None)
-    monkeypatch.setattr(
-        gpu_model_runner_patch, "discover_worker_runners", lambda: (("GPU", Runner),)
-    )
-    monkeypatch.setattr(model_runner_patch, "freeze_gc_after_graph_capture", lambda _: None)
-    capture = Mock()
-    get_owner = Mock(return_value=SimpleNamespace(execute=Mock(return_value="stage")))
-    monkeypatch.setattr(gr_startup, "capture_cuda_v1_forward", capture)
-    monkeypatch.setattr(stages, "get_stage_runner", get_owner)
-    model_runner_patch.apply_worker_patches()
-    # A later environment change cannot change either installed entrypoint.
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    worker = Runner()
-    delegate = SimpleNamespace(
-        pending_stage_sample=False,
-        execute_model=lambda *args: getattr(Runner.execute_model, "_gr_runner_implementation")(
-            worker, *args
-        ),
-    )
-    setattr(
-        worker,
-        "_gr_backend_binding",
-        SimpleNamespace(stage=getattr(Runner, "_gr_stage_binding"), runner_adapter=delegate),
-    )
-    assert worker.capture_model() == "native capture"
-    capture.assert_called_once_with(worker, hooks_type=CudaStageHooksV1, allow_eager_fallback=False)
-    output = _scheduled_frame(**{GR_STAGE_OUTPUT_ATTR: {"session": object()}})
-    assert worker.execute_model(output) == "stage"
-    assert get_owner.call_args.kwargs["hooks_type"] is CudaStageHooksV1
 
 
 def test_v2_retirement_does_not_read_startup_config(monkeypatch: pytest.MonkeyPatch) -> None:

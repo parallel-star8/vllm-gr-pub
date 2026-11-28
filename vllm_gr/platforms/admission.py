@@ -7,9 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm_gr.config.backend_plan import backend_wire
-from vllm_gr.config.resolved_choices import read_resolved_choices
-
 if TYPE_CHECKING:
     from vllm_gr.v1.beam.batch_contracts import BeamBatchRequest
 
@@ -25,6 +22,10 @@ class BeamLimits:
     runner_generation: str
     local_kv_heads: int | None
     head_size: int | None
+    platform_class: str | None = None
+    supports_unconstrained: bool = False
+    supports_dynamic_width: bool = False
+    supports_sid_stage_vocab: bool = False
 
     def uses_retained_widths(self, config: Any) -> bool:
         options = config.deployment
@@ -41,6 +42,12 @@ class BeamLimits:
             raise ValueError("Invalid Beam admission retain_candidate_widths")
         if self.constraint_backend is not None and not isinstance(self.constraint_backend, str):
             raise ValueError("Invalid Beam admission constraint_backend")
+        if (
+            type(self.supports_unconstrained) is not bool
+            or type(self.supports_dynamic_width) is not bool
+            or type(self.supports_sid_stage_vocab) is not bool
+        ):
+            raise ValueError("Invalid Beam admission capabilities")
         if self.runner_generation not in ("v1", "v2"):
             raise ValueError("Invalid Beam admission runner_generation")
         budget = self.max_decode_rows
@@ -62,35 +69,11 @@ def local_kv_geometry(config: Any) -> tuple[int | None, int | None]:
 
 
 def beam_limits(config: Any) -> BeamLimits:
-    wire = backend_wire(config)
-    if wire is not None:
-        # Re-admission replaces the envelope. Keep the verified limits on that
-        # engine, so every member of a batch need not re-hash the engine plan.
-        cached = getattr(config, "_gr_beam_limits", None)
-        if isinstance(cached, tuple) and cached[0] is wire:
-            return cached[1]
-        admitted = read_resolved_choices(config)
-        assert admitted is not None
-        choices = admitted.choices.to_dict()
-        if "beam_limits" in choices:
-            fields = choices["beam_limits"]
-            if not isinstance(fields, dict) or fields.keys() != {
-                "device_type",
-                "max_decode_rows",
-                "retain_candidate_widths",
-                "constraint_backend",
-                "runner_generation",
-                "local_kv_heads",
-                "head_size",
-            }:
-                raise ValueError("Invalid Beam admission limits")
-            limits = BeamLimits(**fields)
-            try:
-                object.__setattr__(config, "_gr_beam_limits", (wire, limits))
-            except (AttributeError, TypeError):
-                pass
-            return limits
-    # Configs produced before limits were recorded carry only native placement.
+    additional = getattr(config, "additional_config", None) or {}
+    fields = additional.get("vllm_gr_limits")
+    if fields is not None:
+        return BeamLimits(**fields)
+    # Before admission a host config may carry only native placement.
     device = getattr(getattr(config, "device_config", None), "device", None)
     placement = str(device).split(":", 1)[0] if device is not None else None
     scheduler = getattr(config, "scheduler_config", None)
@@ -103,7 +86,18 @@ def beam_limits(config: Any) -> BeamLimits:
 
         if GRConfig.from_vllm_config(config).beam_max_decode_steps > 3:
             heads, size = local_kv_geometry(config)
-    return BeamLimits(placement, budget, placement == "npu", backend, generation, heads, size)
+    return BeamLimits(
+        placement,
+        budget,
+        placement == "npu",
+        backend,
+        generation,
+        heads,
+        size,
+        supports_unconstrained=backend is not None,
+        supports_dynamic_width=backend is not None,
+        supports_sid_stage_vocab=placement == "npu",
+    )
 
 
 def validate_beam_batch(request: BeamBatchRequest, limits: BeamLimits) -> None:

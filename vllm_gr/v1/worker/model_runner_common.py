@@ -16,7 +16,6 @@ from typing import Any
 from vllm_gr.v1.beam import BEAM_DATA_VAR
 from vllm_gr.v1.worker import gr_execution, gr_gc
 from vllm_gr.v1.worker import model_runner_contracts as contracts
-from vllm_gr.v1.worker.stage_binding import bound_stage
 
 
 def make_patched_execute_model(
@@ -57,9 +56,8 @@ def make_patched_execute_model(
             )
         finished = getattr(scheduler_output, "finished_req_ids", ())
         if finished:
-            binding = bound_stage(self)
-            if binding is not None:
-                binding.cancel_finished(self, finished)
+            if getattr(self, "_gr_ready", False):
+                self.cancel_finished_gr(finished)
         # Ordinary execution must not inherit a completed stage's context.
         self._current_beam_data = {}
         self._current_beam_info = {"beam_data": {}, "req_ids": []}

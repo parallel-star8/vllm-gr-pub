@@ -54,7 +54,6 @@ from vllm_gr.v1.worker.npu.npu_beam_stage_adapter import (
     NPUEagerStagePlan,
     validate_npu_eager_capabilities,
 )
-from vllm_gr.v1.worker.stage_binding import StageBinding
 
 
 class NPUEagerBeamStageRunner:
@@ -129,10 +128,8 @@ class NPUEagerBeamStageRunner:
                     plan.execution, self.attention_batch.sessions
                 )
             return
-        from vllm_gr.v1.worker.gr_context import (
-            _create_beam_context,
-            _get_gr_config,
-        )
+        from vllm_gr.platforms.ascend.decode import create_beam_context
+        from vllm_gr.v1.worker.gr_context import _get_gr_config
 
         execution = plan.execution
         if self.prefill_candidates is None:
@@ -170,7 +167,7 @@ class NPUEagerBeamStageRunner:
             ):
                 if context is not None and context.registry.num_active_sessions:
                     raise RuntimeError("cannot replace an active NPU Beam eager fallback context")
-                context = _create_beam_context(
+                context = create_beam_context(
                     self.worker,
                     config,
                     max_batch=execution.batch_size,
@@ -1084,16 +1081,3 @@ def _stage_graph_status(worker: Any) -> dict[str, Any]:
         ),
         "fallback": dict(getattr(worker, "_beam_graph_fallback_reasons", {})),
     }
-
-
-def make_npu_stage_binding() -> StageBinding:
-    return StageBinding(
-        "ascend.v1",
-        execute_npu_stage,
-        lambda worker, grammar_output=None: worker._gr_npu_stage_runner.sample(grammar_output),
-        execute_npu_gr_retirement,
-        # Ascend releases its owner through the explicit retirement frame.
-        lambda worker, finished: None,
-        capture_ascend_forward,
-        _stage_graph_status,
-    )

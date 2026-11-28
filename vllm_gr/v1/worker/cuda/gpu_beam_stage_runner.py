@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
-from functools import partial
 from threading import Condition, Lock
 from typing import Any, cast
 
@@ -86,7 +85,6 @@ from vllm_gr.v1.worker.cuda.gr_inputs import (
     PreparedGRInputs,
     bind_device_inputs,
 )
-from vllm_gr.v1.worker.stage_binding import StageBinding
 
 METADATA_ABI = 1
 _UNCONSTRAINED_HEAD_LAYOUT_LOCK = Lock()
@@ -1624,17 +1622,3 @@ def _stage_graph_status(worker: Any) -> dict[str, Any]:
         "captured": graph.captured_shapes() if graph is not None else [],
         "fallback": {str(batch): "capture_unsupported" for batch in (failures or {})},
     }
-
-
-def make_cuda_stage_binding(
-    implementation_id: str, hooks_type: CudaStageHooksType, capture: Callable[[Any, bool], bool]
-) -> StageBinding:
-    return StageBinding(
-        implementation_id,
-        partial(execute_cuda_stage, hooks_type=hooks_type),
-        lambda worker, grammar_output=None: worker._gr_gpu_stage_runner.sample(grammar_output),
-        execute_gr_retirement,
-        cancel_finished_stage,
-        capture,
-        _stage_graph_status,
-    )

@@ -10,7 +10,7 @@ from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 
-from vllm_gr.v1.worker.stage_binding import require_stage
+from vllm_gr.v1.worker.runner import require_gr_runner
 
 
 def _copy_record(value: Any) -> Any:
@@ -93,22 +93,22 @@ def execute_gr_stage(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    stage = require_stage(worker)
-    adapter = worker._gr_backend_binding.runner_adapter
-    if adapter.pending_stage_sample is not False:
+    require_gr_runner(worker)
+    if worker._gr_pending_stage_sample is not False:
         raise RuntimeError("GR sampling must consume the previous dispatch")
     try:
-        result = stage.execute(worker, worker_input(scheduled), original, *args, **kwargs)
+        result = worker.execute_gr_stage(worker_input(scheduled), original, *args, **kwargs)
     except Exception as error:
-        adapter.pending_stage_sample = error
+        worker._gr_pending_stage_sample = error
         raise
     if result is None:
-        adapter.pending_stage_sample = True
+        worker._gr_pending_stage_sample = True
     return result
 
 
 def execute_gr_retirement(worker: Any, scheduled: Any) -> Any:
-    return require_stage(worker).retire(worker, worker_input(scheduled))
+    require_gr_runner(worker)
+    return worker.retire_gr_stage(worker_input(scheduled))
 
 
 def _dispatch_retirement_frame(self: Any, scheduler_output: Any) -> Any:
