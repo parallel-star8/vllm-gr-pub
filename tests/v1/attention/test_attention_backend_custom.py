@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import unittest
 from types import SimpleNamespace
@@ -28,6 +29,17 @@ class TestCustomAttentionBackendMarker(unittest.TestCase):
         from vllm_gr.engine.arg_utils_gr import patch_create_engine_config
 
         patch_create_engine_config()
+        # These tests verify marker reconciliation mechanics, not a platform
+        # runner-generation policy. Force ModelRunner V1 so the Ascend
+        # platform's own "NPU GR requires ModelRunner V1" admission rule (a
+        # real product rule, tested in the platform suites) cannot reject the
+        # marker-only configs these fixtures build.
+        cls._v2_env = mock.patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "0"})
+        cls._v2_env.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._v2_env.stop()
 
     def _make_fake_config(self, backend=None, marker=None):
         """Build a lightweight VllmConfig-like object for mocking."""

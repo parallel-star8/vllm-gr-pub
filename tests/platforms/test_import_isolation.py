@@ -185,6 +185,15 @@ if not __import__("torch").cuda.is_available():
     CudaPlatform.get_device_capability = classmethod(
         lambda *args, **kwargs: None
     )
+
+# vllm's fused-MoE import chain resolves CUTLASS support at module import
+# through current_platform. Import it while the native platform is still
+# selected: CUDA hosts provide the compiled op for the probe, and every
+# other host short-circuits on is_cuda() == False. After the CUDA platform
+# switch below, the cached modules need no re-execution, so a host whose
+# vllm build lacks CUDA ops (an Ascend image) cannot crash in the probe.
+import vllm.v1.core.sched.scheduler  # noqa: F401
+
 vllm.platforms.current_platform = platform
 
 from vllm_gr.plugin import initialize_runtime
@@ -294,6 +303,23 @@ import sys
 # Exercise GR imports independently of third-party plugin autoload on the host.
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 os.environ["VLLM_PLUGINS"] = ""
+
+# Ascend images install torch_npu, and this transformers release eagerly
+# imports it from its NPU flash-attention integration whenever its package
+# probe finds it. The shared modules legitimately reach vllm.config ->
+# transformers, so hide the package from that upstream probe: the
+# integration stays inert and the contract under test - the shared worker
+# modules load no device backend - stays observable on every host.
+import importlib.util
+
+_orig_find_spec = importlib.util.find_spec
+
+def _hide_torch_npu(name, *args, **kwargs):
+    if name == "torch_npu":
+        return None
+    return _orig_find_spec(name, *args, **kwargs)
+
+importlib.util.find_spec = _hide_torch_npu
 
 for suffix in (
     "worker.gr_execution",

@@ -49,7 +49,13 @@ class AscendGRPlatform(GRPlatform, NPUPlatform):
 
     def check_and_update_gr_config(self, config) -> None:
         cache, model = config.cache_config, config.model_config
-        if not getattr(cache, "user_specified_block_size", False) and not model.is_hybrid:
+        # EngineArgs paths can carry configs whose model_config is not yet
+        # constructed (and it is legitimately None in unit-test doubles);
+        # the retired AscendConfigService tolerated that via getattr, and
+        # config-finalization order must not depend on model presence here.
+        if not getattr(cache, "user_specified_block_size", False) and not getattr(
+            model, "is_hybrid", False
+        ):
             cache.block_size = 128
         from vllm_gr.config import GRAttentionBackend, GRConfig
 

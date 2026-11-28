@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
-"""Discover and cache an independent GR platform, following vLLM-Omni."""
+"""Discover and cache an independent GR platform, following vLLM-Omni.
+
+Importing this package must not load vllm, torch, or any device backend:
+the winning class is imported only during resolution, and the interface
+contract (which subclasses vLLM's Platform) is deferred for the same
+reason. Probes read vLLM's current_platform lazily inside their bodies.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +17,13 @@ from inspect import signature
 from threading import RLock
 from typing import TYPE_CHECKING
 
-from vllm.platforms.interface import Platform
-from vllm.utils.import_utils import resolve_obj_by_qualname
-
 from .errors import AmbiguousBackendError, UnsupportedBackendError
 from .identity import qualified_class_name
-from .interface import GRPlatform, UnspecifiedGRPlatform
+
+if TYPE_CHECKING:
+    from vllm.platforms.interface import Platform
+
+    from .interface import GRPlatform
 
 logger = logging.getLogger(__name__)
 PLATFORM_PLUGINS_GROUP = "vllm_gr.platform_plugins"
@@ -68,6 +75,10 @@ def _origin(entry: metadata.EntryPoint) -> str:
 
 
 def _resolve(native: Platform) -> GRPlatform:
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+
+    from .interface import GRPlatform, UnspecifiedGRPlatform
+
     matches: list[tuple[metadata.EntryPoint, str]] = []
     for entry in metadata.entry_points(group=PLATFORM_PLUGINS_GROUP):
         try:
@@ -138,6 +149,8 @@ def _resolve(native: Platform) -> GRPlatform:
 
 def get_current_gr_platform(*, required: bool = True) -> GRPlatform:
     from vllm.platforms import current_platform
+
+    from .interface import UnspecifiedGRPlatform
 
     global _current_gr_platform, _native_platform, _resolving
     with _lock:
